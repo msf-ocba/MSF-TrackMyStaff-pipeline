@@ -2,14 +2,13 @@
 common_config.py
 -----------------
 Shared helper to load settings from config.conf.
-Imported by every numbered script in this pipeline — keeps the
+Imported by every numbered script in this pipeline, keeps the
 connection/path/rule settings in ONE place instead of duplicated
 across files.
 """
 import configparser
 import os
 from datetime import datetime, timedelta
-
 
 def load_config(path="config.conf"):
     if not os.path.exists(path):

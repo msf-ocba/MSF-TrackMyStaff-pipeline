@@ -1,57 +1,55 @@
 """
 03_clean_transform.py
 -----------------------
-This script adds the
-'Family' and 'Keep?' columns to the A3 workbook and saves the result
-as a new A4 workbook - mirroring the same two columns that exist on
-the B template's 'EXTRACTION_TMS_OCBA-ORIG' tab.
+Processes the A3 workbook by adding the 'Family' and 'Keep?' columns,
+then saves the result as A4.
 
-Reproduces the FIRST part of spec section 4, step 8 ("Clean"):
+The script identifies records that should be excluded from later stages
+of the import process using three validation checks.
 
-  "Filter out any line which DOES NOT correspond to an asset (Pasting
-   on visible cells: Find & Select > Go to Special > Visible cells
-   only), or does NOT correspond to a TMS mission."
+VALIDATION
 
-Implemented as three checks, each able to fire independently. ALL
-failing reasons are combined (not just the first match):
+Each row is evaluated against the following criteria:
 
-  1. Family check ("NOT ASSET"):
-     Family = first 4 characters of FCL_ART_CODE (same derivation as
-     B's formula: =LEFT(Table13[[#This Row],[FCL_ART_CODE]],4)).
-     If Family starts with 'K' -> not an asset (MSF Logistique uses a
-     leading 'K' article-code family for Kits).
+  - Family Check
+      Derives the Family value from the first four characters of
+      FCL_ART_CODE. Articles belonging to the Kit family are marked
+      as "NOT ASSET".
 
-  2. Customer code check ("NOT DEPLOYED"):
-     If FCT_CLI_CODE_FAC != ES001MES -> not deployed.
+  - Customer Check
+      Confirms the customer code represents a deployed OC (Operational Center).
+      Non-matching records are marked as "NOT DEPLOYED".
 
-  3. Mission code check ("NOT DEPLOYED"):
-     PCT_CLI_CODE_LIV's first 2 characters must be one of the prefixes
-     listed in Mission_code_prefixes.txt (editable allowlist, kept
-     outside this script so it can be updated without touching code).
-     If the prefix isn't in that list -> not deployed.
+  - Mission Check
+      Verifies the mission code prefix against the list in
+      Mission_code_prefixes.txt. Prefixes not found in the list are
+      marked as "NOT DEPLOYED".
 
-Keep? column behavior:
-  - If a row fails ANY of the checks above, Keep? contains ALL of the
-    failing reasons, semicolon-separated (e.g. "NOT ASSET; NOT DEPLOYED").
-  - If a row passes all three checks, Keep? is left BLANK. These rows
-    still need further checks.
-    a blank Keep? is not the same as "confirmed asset", it just means
-    "nothing disqualified it yet".
+KEEP? COLUMN
 
-Output: A4_EXTRACTION_TMS_OCBA_YYMMDD.xlsx, in the SAME dated work
-folder as A3, containing all of A3's original columns plus Family and
-Keep? (added as the first two columns, matching B's column order:
-KEEP?, Family, then the 17 original MSF Logistique fields). A copy is
-also sent to output_dir/<week_tag>/ (e.g. "Y26W25" - the ISO week
-BEFORE the one this script is run in; see
-common_config.compute_week_tag()), the same shared week-tag folder
-used by 04_validate.py and 05_export.py for their own outputs.
+The Keep? column records any validation results for each row:
+
+  - Blank: the row passed all validation checks.
+  - "NOT ASSET": excluded because it is not an asset.
+  - "NOT DEPLOYED": excluded because it is not associated with a
+    deployed OC (Operational Center) and Mission.
+  - Multiple reasons are recorded together where applicable.
+
+OUTPUT
+
+The script creates:
+
+  - A4_EXTRACTION_TMS_OCBA_YYMMDD.xlsx
+
+The workbook contains all original A3 columns, together with the new
+Family and Keep? columns, and is saved to the working folder and the
+configured output folder.
 
 Usage:
     python 03_clean_transform.py [path_to_A3_workbook.xlsx]
 
-If the A3 path is omitted, the script looks for the latest dated
-subfolder under work_dir and uses the A3_*.xlsx file inside it.
+If no A3 workbook is supplied, the script automatically selects the
+most recent A3 file.
 """
 import os
 import sys
@@ -72,7 +70,7 @@ REQUIRED_SOURCE_COLUMNS = [
     "PCT_CLI_CODE_LIV",
 ]
 
-PREFIX_ALLOWLIST_FILE = "./templates/Mission_code_prefixes.txt"  # fallback default; see config.conf [templates] project_code_prefixes_path
+PREFIX_ALLOWLIST_FILE = "./templates/Mission_code_prefixes.txt"  # fallback default; see config.conf [templates] mission_code_prefixes_path
 
 NOT_ASSET = "NOT ASSET"
 NOT_DEPLOYED = "NOT DEPLOYED"
@@ -130,10 +128,10 @@ def check_required_columns(df):
         )
 
 
-def load_project_code_prefixes(path):
+def load_mission_code_prefixes(path):
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"Project code prefix allowlist not found at '{path}'. "
+            f"Mission code prefix allowlist not found at '{path}'. "
             f"Create it (one 2-character prefix per line) before running this script."
         )
     prefixes = set()
@@ -145,7 +143,7 @@ def load_project_code_prefixes(path):
             prefixes.add(line.upper())
     if not prefixes:
         print(f"  WARNING: '{path}' contains no prefixes - every row will fail the "
-              f"project code check.")
+              f"mission code check.")
     return prefixes
 
 
@@ -166,9 +164,9 @@ def compute_keep(row, valid_prefixes, customer_code):
     if fct_cli != customer_code:
         reasons.append(NOT_DEPLOYED)
 
-    project_code = str(row.get("PCT_CLI_CODE_LIV", "")).strip()
-    project_prefix = project_code[:2].upper()
-    if project_prefix not in valid_prefixes:
+    mission_code = str(row.get("PCT_CLI_CODE_LIV", "")).strip()
+    mission_prefix = mission_code[:2].upper()
+    if mission_prefix not in valid_prefixes:
         reasons.append(NOT_DEPLOYED)
 
     return "; ".join(reasons)  # blank string if all checks passed
@@ -344,10 +342,10 @@ def main():
 
     customer_code = cfg.get("extraction_rules", "customer_code", fallback="ES001MES")
     prefix_allowlist_path = cfg.get(
-        "templates", "project_code_prefixes_path", fallback=PREFIX_ALLOWLIST_FILE
+        "templates", "mission_code_prefixes_path", fallback=PREFIX_ALLOWLIST_FILE
     )
-    valid_prefixes = load_project_code_prefixes(prefix_allowlist_path)
-    print(f"Loaded {len(valid_prefixes)} valid project code prefix(es): {sorted(valid_prefixes)}")
+    valid_prefixes = load_mission_code_prefixes(prefix_allowlist_path)
+    print(f"Loaded {len(valid_prefixes)} valid mission code prefix(es): {sorted(valid_prefixes)}")
 
     a4_df = build_a4_dataframe(df, valid_prefixes, customer_code)
 

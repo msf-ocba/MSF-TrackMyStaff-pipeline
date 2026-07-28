@@ -1,167 +1,98 @@
 """
 05_export.py
 --------------
-Takes this batch's A5 workbook and produces the FINAL import file,
-A6_EXTRACTION_TMS_OCBA_YYMMDD.xlsx, mapped onto the columns of
-C_adminTemplate_IMPORT_asset_MSF_LOG_EN.xlsx (the TMS asset-import
-template).
+Takes this batch's A5 workbook and produces the final import file,
+A6_EXTRACTION_TMS_OCBA_YYMMDD.xlsx, mapped to the structure of
+C_adminTemplate_IMPORT_asset_MSF_LOG_EN.xlsx for import into TMS.
 
-NOTE: as of this version, this script no longer sends the completion
-email itself. It builds A6 and writes a small "meta" JSON file
-(A6_META_EXTRACTION_TMS_OCBA_YYMMDD.json) alongside it, in the same
-dated output folder, recording everything needed to compose that
-email (counts, per-row warning details, file paths). The email is
-now sent by 06_notify.py - run that script right after this one to
-notify the team. See that script's module docstring for details.
+The script also creates a metadata file,
+A6_META_EXTRACTION_TMS_OCBA_YYMMDD.json, alongside A6. This records the
+batch summary, warning details and output file paths used by
+06_notify.py to generate the completion email.
 
-WHAT THIS SCRIPT CHECKS BEFORE BUILDING A6
-  1. Article Code Check: every row in A5 should already be 'Checked'
-     (set by 04_validate.py). Any row still marked 'Review' means a
-     human needs to look up that article code in TMS and update A5
-     before it's truly ready - but per current process, this does NOT
-     block the export. A6 is still produced for ALL rows (Checked and
-     Review alike), and a clear warning (recorded in the meta JSON for
-     06_notify.py to email) lists exactly which rows still need review.
-  2. Location lookup: each row's first-2-characters of PCT_CLI_CODE_LIV
-     is matched against templates/location.xlsx to find the right
-     "Transit In" location path (see build_location_lookup() docstring
-     for how the match works). If a prefix has no match, that row's
-     Location is left BLANK in A6 (not dropped), and is listed in the
-     same warning/meta-JSON entry as the Review rows.
-  3. Duplicate Article Code + Serial Number: after A6 is built, each
-     row's (Article Code, Serial number) PAIR is checked for duplicates
-     (case/whitespace insensitive on both fields). A row is only
-     flagged as a duplicate if ANOTHER row in the batch has BOTH the
-     same Article Code AND the same Serial number - matching Article
-     Code alone is common and expected (many identical items share a
-     code) and is not, by itself, a problem. It's only when the Serial
-     number also matches that TMS will actually block the import as a
-     true duplicate, so that's the pair this check flags. Flagged rows
-     are NOT dropped or blocked, just highlighted (see conditional
-     formatting below) and reported.
+VALIDATION
 
-Neither check blocks the export - A6 is always written for every row
-in A5. The warnings exist so a technician can fix A5/location.xlsx and
-re-run, or just manually patch the handful of flagged rows directly in
-A6 before it's imported into TMS.
+Before exporting, the script performs several checks and records any
+issues found:
+
+  - Article Code Check: identifies rows still marked for review.
+  - Location Check: matches the mission code to the appropriate TMS
+    location using templates/location.xlsx. If no match is found, the
+    Location field is left blank and the row is flagged.
+  - Duplicate Check: identifies duplicate combinations of Article Code
+    and Serial Number within the batch.
+
+These checks are informational only and do not prevent A6 from being
+generated.
 
 A6 FORMATTING
-  - Columns are auto-sized to fit their content (header or longest
-    value in that column, whichever is larger) so a technician can see
-    each field in full without resizing columns by hand. Width is
-    capped at 50 characters so one long outlier value can't blow out
-    the whole sheet - anything longer just wraps/truncates visually
-    and can still be opened in the formula bar.
-  - Rows are colour-highlighted (entire row, not just one cell) using
-    a distinctive palette so problem rows - and rows that are all
-    clear - jump out immediately when scanning the sheet:
-        - Article Code Check = Review         -> amber/yellow
-        - No Location match                    -> orange
-        - Duplicate Article Code + Serial Number -> red
-        - Clean (flagged by none of the above) -> green
-    If a row is flagged by more than one of the three warning checks,
-    the most severe colour wins (duplicate > missing location >
-    review), so every flagged row still gets exactly one clear
-    highlight. A row only gets the green "all good" highlight if it is
-    flagged by none of the three checks.
 
-A5B - THE "FLAGGED ITEMS" FILE (NOT created by this script)
-  A5B_EXTRACTION_TMS_OCBA_YYMMDD.xlsx is created earlier in the
-  pipeline, by 04_validate.py - it holds the A4 rows that were
-  EXCLUDED before A5/A6 (i.e. every row whose 'Keep?' was NOT blank:
-  NOT ASSET / NOT DEPLOYED / both), with the same Keep?-based row
-  colouring as A4. This script does NOT generate A5B, and (as of this
-  version) does NOT go looking for it either - that lookup, plus
-  attaching it to the completion email, now happens in 06_notify.py.
+The exported workbook is formatted to make review easier:
 
-OUTPUT FOLDER NAMING
-  Previously, each run's outputs went into a folder named after the
-  batch's date tag (e.g. "260629"). Output folders are now named using
-  the shared week_tag convention (common_config.compute_week_tag()) -
-  the ISO week BEFORE the one this script is run in, e.g. "Y26W25" if
-  run during ISO week 26 - since the batch being processed is always
-  last week's extract. This means every batch processed in the same
-  calendar week lands in the same folder, regardless of which day
-  within that week it was run. The A6 filename itself still uses the
-  batch's own date tag (taken from the A5 filename), only the folder
-  name changed.
+  - Columns are automatically sized to fit their contents, with long
+    values wrapped where necessary.
+  - Rows are colour-coded according to their status:
+      - Green: no issues found.
+      - Yellow: Article Code requires review.
+      - Orange: missing Location.
+      - Red: duplicate Article Code and Serial Number.
 
-HANDOFF TO 06_notify.py
-  This script always writes A6_META_EXTRACTION_TMS_OCBA_YYMMDD.json
-  into the same dated output folder as A6. It contains the week tag,
-  date tag, row counts, per-row warning details (review / missing
-  location / duplicate), and the A6 path - everything 06_notify.py
-  needs to compose and send the completion email, without having to
-  re-read or re-derive anything from A5. Run 06_notify.py right after
-  this script finishes.
+OUTPUT
 
-COLUMN MAPPING (A5 -> A6), reproducing the formulas found in
-C_adminTemplate_IMPORT_asset_MSF_LOG_EN.xlsx's sample rows:
+The script creates:
 
-  A6 column            <- A5 source / rule
-  -----------------        -----------------------------------------------
-  Article Code          <- FCL_ART_CODE, as-is
-  Location               <- looked up from templates/location.xlsx using
-                             the first 2 characters of PCT_CLI_CODE_LIV
-                             (e.g. "CF160MES" -> "CF" -> the location
-                             path whose mission-code segment starts with
-                             "CF"). Blank if no match found.
-  Status                 <- always "In Transit"
-  Serial number           <- PCL_NO_SERIE_LOT, as-is
-  Project Code            <- first 5 characters of PCT_CLI_CODE_LIV
-                             (matches the template's own
-                             =LEFT(...,5) formula)
-  Brand                    <- MARQUE, blank if MARQUE is blank
-  Model                    <- MODEL, blank if MODEL is blank
-  Comment                  <- "Shipped from BDO on <SDT_DT_ENLEV>" +
-                             newline + "within Kit <CODE_KIT>" if
-                             CODE_KIT is present
-  Purchase reference       <- PCT_REF_CMDE1, as-is
-  Currency                  <- always "EUR"
-  Price                     <- PRIX_VENTE_UNIT, with comma decimal
-                             converted to a period (e.g. "491,96" ->
-                             "491.96")
-  Invoice Number            <- FCT_NO_FACTURE, as-is
-  Warranty                  <- GARANTIE + " months", blank only if
-                             GARANTIE is truly blank/empty (a value of
-                             "0" produces "0 months", matching the
-                             template's own ISBLANK-only formula - it
-                             does not treat 0 as blank)
-  Manufacturing date        <- DATE_FABRICATION, as-is, blank if blank
+  - A6_EXTRACTION_TMS_OCBA_YYMMDD.xlsx – the final TMS import file.
+  - A6_META_EXTRACTION_TMS_OCBA_YYMMDD.json – metadata used by
+    06_notify.py when composing the completion email.
 
-  NOTE: "Barcode", "Article Description (NOT to be imported)" and
-  "Intern Ref or HQ Id" are DROPPED from A6 entirely (not just left
-  blank) - they're not sourced from A5 and aren't needed for import.
+COLUMN MAPPING (A5 → A6)
 
-Any A5 column with no entry above (Keep?, Family, ART_DES1 itself,
-FCT_CLI_CODE_FAC, QTE, CODE_KIT, KIT_NO_SERIE_LOT, KIT_LOT_NO,
-SOURCE_FILE, Article Code Check) is intentionally dropped from A6 - it
-either has no corresponding column in the C template, or is consumed
-indirectly (e.g. CODE_KIT and SDT_DT_ENLEV feed into the Comment text
-but get no column of their own).
+  A6 column              <- A5 source / rule
+  ------------------        --------------------------------------------
+  Article Code           <- FCL_ART_CODE
+  Location               <- Lookup from location.xlsx using the first
+                             two characters of PCT_CLI_CODE_LIV
+  Status                 <- "In Transit"
+  Serial number          <- PCL_NO_SERIE_LOT
+  Project Code           <- First five characters of PCT_CLI_CODE_LIV
+  Brand                  <- MARQUE
+  Model                  <- MODEL (maximum 50 characters)
+  Comment                <- Shipment date and Kit reference (when
+                             available)
+  Purchase reference     <- PCT_REF_CMDE1
+  Currency               <- "EUR"
+  Price                  <- PRIX_VENTE_UNIT (decimal separator
+                             normalised)
+  Invoice Number         <- FCT_NO_FACTURE
+  Warranty               <- GARANTIE in months
+  Manufacturing date     <- DATE_FABRICATION
+
+Columns not required by the TMS import template are omitted from A6.
 
 Usage:
     python 05_export.py [path_to_A5_workbook.xlsx] [path_to_location.xlsx]
 
-If the A5 path is omitted, the script looks in the dated work
-subfolders (same convention as scripts 3/4) for the most recent
-A5_*.xlsx. If the location path is omitted, the path in config.conf
-[templates] location_list_path is used.
+If no A5 workbook is specified, the script automatically selects the
+most recent A5 file. If no location file is supplied, the path defined
+in config.conf is used.
 
-After this script finishes, run:
+After the export completes, run:
+
     python 06_notify.py
-to send (or print, if SMTP isn't configured yet) the completion email.
+
+to send the batch completion email.
 """
 import os
 import re
 import sys
 import glob
 import json
+import math
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Alignment
 
 from common_config import load_config, get_paths, get_dated_subdir, compute_week_tag
 
@@ -211,6 +142,20 @@ CLEAN_FILL = PatternFill(start_color="4CAF50", end_color="4CAF50", fill_type="so
 
 MIN_COLUMN_WIDTH = 10
 MAX_COLUMN_WIDTH = 50  # cap so one long outlier value doesn't blow out the sheet
+
+# TMS's own import template enforces hard character limits on certain
+# fields (confirmed by TMS rejecting the import with "Field 'Model'
+# must not be longer than '50' characters"). Any A6 value longer than
+# the limit below is truncated before writing, since TMS will reject
+# the entire import otherwise. Extend this dict if TMS reports the
+# same error for other fields in future.
+TMS_FIELD_MAX_LENGTHS = {
+    "Model": 50,
+}
+
+# Default row height (Excel's default, in points) used as the basis for
+# growing a row when it contains a wrapped cell.
+DEFAULT_ROW_HEIGHT = 15
 
 
 def find_latest_a5(work_dir):
@@ -328,6 +273,10 @@ def build_a6_dataframe(df, location_lookup):
     common and not a problem; it's the (Article Code, Serial number)
     PAIR repeating that means TMS will actually reject the import as a
     true duplicate.
+
+    Any field listed in TMS_FIELD_MAX_LENGTHS (e.g. Model) is silently
+    truncated to its max length before this returns, since TMS rejects
+    the whole import otherwise.
     """
     out = pd.DataFrame(index=df.index)
 
@@ -360,6 +309,14 @@ def build_a6_dataframe(df, location_lookup):
 
     out = out[A6_COLUMNS]
 
+    # TMS field-length enforcement: truncate any field TMS is known to
+    # reject past a certain length (see TMS_FIELD_MAX_LENGTHS), so the
+    # import doesn't fail outright.
+    for col_name, max_len in TMS_FIELD_MAX_LENGTHS.items():
+        if col_name not in out.columns:
+            continue
+        out[col_name] = out[col_name].fillna("").astype(str).str.slice(0, max_len)
+
     # Duplicate Article Code + Serial Number check - case/whitespace
     # insensitive on both fields. A row only counts as a duplicate if
     # some OTHER row shares both its Article Code AND its Serial
@@ -381,6 +338,8 @@ def compute_column_widths(values_by_column, headers):
     manually resizing columns - width follows whichever is longer, the
     header or the longest value in that column - capped at
     MAX_COLUMN_WIDTH so one outlier value doesn't blow out the sheet.
+    Cells longer than the cap get text-wrapping applied instead (see
+    apply_wrap_text_for_long_values()), so nothing is hidden.
     """
     widths = []
     for col_name in headers:
@@ -393,10 +352,62 @@ def compute_column_widths(values_by_column, headers):
     return widths
 
 
+def apply_wrap_text_for_long_values(ws, df, headers, column_widths):
+    """
+    Any cell whose value is longer than MAX_COLUMN_WIDTH characters
+    would otherwise be visually clipped by the column-width cap, even
+    though the value is still fully present in the file (readable via
+    the formula bar). Instead of leaving it clipped, turn on text
+    wrapping for that specific cell so the full value is visible
+    directly in the sheet, and grow that row's height to fit the
+    number of wrapped lines it now needs.
+
+    This ONLY changes how long values are displayed - it does not
+    alter, shorten, or touch the underlying value written to the cell,
+    since A6 is imported straight into TMS and its data must stay
+    exactly as computed.
+    """
+    row_heights = {}  # excel row number -> max lines needed across its cells
+
+    for col_idx, col_name in enumerate(headers, start=1):
+        col_letter = get_column_letter(col_idx)
+        col_width = column_widths[col_idx - 1]
+        values = df[col_name].tolist()
+        for row_offset, value in enumerate(values):
+            text = "" if value is None else str(value)
+            if not text:
+                continue
+
+            # A value already containing newlines (e.g. the multi-line
+            # Comment field) wraps at those newlines regardless of
+            # length, so it also benefits from wrap_text once any one
+            # of its lines exceeds the column width.
+            longest_line = max(len(line) for line in text.split("\n"))
+            if longest_line <= MAX_COLUMN_WIDTH and "\n" not in text:
+                continue
+
+            excel_row = row_offset + 2  # +1 for header, +1 for 1-indexing
+            cell = ws.cell(row=excel_row, column=col_idx)
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+            # Estimate wrapped line count: existing newlines each force
+            # a break, plus each of those segments may itself wrap
+            # across ceil(len/col_width) lines.
+            lines_needed = 0
+            for line in text.split("\n"):
+                lines_needed += max(1, math.ceil(len(line) / col_width))
+            row_heights[excel_row] = max(row_heights.get(excel_row, 1), lines_needed)
+
+    for excel_row, lines_needed in row_heights.items():
+        ws.row_dimensions[excel_row].height = DEFAULT_ROW_HEIGHT * lines_needed
+
+
 def save_as_table_xlsx(df, output_dir, date_tag, review_mask, missing_location_mask, duplicate_mask):
     """
     Writes A6 as an Excel table, with:
-      - content-based column autofit (capped at MAX_COLUMN_WIDTH), and
+      - content-based column autofit (capped at MAX_COLUMN_WIDTH), with
+        wrap-text applied to any individual cell that exceeds the cap
+        so long values stay fully visible instead of being clipped,
       - entire-row highlight fills for every row: the three warning
         checks (review / missing location / duplicate Article Code +
         Serial number) each get their own distinctive colour, and any
@@ -442,6 +453,10 @@ def save_as_table_xlsx(df, output_dir, date_tag, review_mask, missing_location_m
     widths = compute_column_widths(values_by_column, headers)
     for i, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = width
+
+    # Any value that got clipped by the width cap above gets wrap-text
+    # turned on instead, so it's still fully readable in the sheet.
+    apply_wrap_text_for_long_values(ws, df, headers, widths)
 
     # Entire-row conditional highlighting. Positional arrays (reset_index)
     # so they line up with the itertuples() write order above regardless

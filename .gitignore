@@ -1,6 +1,4 @@
-# ============================================================
 # Secrets / config
-# ============================================================
 # Holds SFTP + SMTP credentials in plain text - never commit this.
 config.conf
 
@@ -8,9 +6,7 @@ config.conf
 *.conf.local
 *.env
 
-# ============================================================
 # Pipeline data & working folders (all runtime-generated)
-# ============================================================
 downloads/
 work/
 output/
@@ -19,15 +15,11 @@ logs/
 # Lock file used by run_pipeline.py
 .pipeline.lock
 
-# ============================================================
-# Templates synced by hand from SharePoint/TMS
+# Templates synced manually from SharePoint/TMS
 # (org data, not code - re-synced locally, not versioned)
-# ============================================================
 templates/
 
-# ============================================================
 # Python
-# ============================================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -42,17 +34,13 @@ venv/
 env/
 ENV/
 
-# ============================================================
 # Excel lock files (left behind if a workbook was open when
 # something crashed, or opened directly from the repo folder)
-# ============================================================
 ~$*.xlsx
 ~$*.xls
 *.xlsx.lock
 
-# ============================================================
 # OS / editor cruft
-# ============================================================
 .DS_Store
 Thumbs.db
 .idea/

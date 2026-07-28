@@ -1,85 +1,64 @@
 """
 06_notify.py
 --------------
-Sends the batch completion email that 05_export.py used to send
-itself. This script reads the meta JSON file 05_export.py writes next
-to A6 (A6_META_EXTRACTION_TMS_OCBA_YYMMDD.json), locates A4 (the full
-pre-filter extract) and A5B (produced earlier by 04_validate.py) if
-they exist, and sends ONE completion email - whether the batch was
-fully clean or some rows need review.
+Sends the batch completion email after 05_export.py has finished.
 
-Run this right after 05_export.py finishes for the same batch.
+The script reads the metadata JSON created alongside A6
+(A6_META_EXTRACTION_TMS_OCBA_YYMMDD.json), uses it to locate the
+generated output files, and sends a single completion email summarising
+the batch.
 
-WHAT THIS SCRIPT DOES NOT DO
-  It does not build A6, and it does not re-run any of the Article Code
-  / Location / Duplicate checks - all of that already happened in
-  05_export.py, and its results (counts, per-row warning details, the
-  A6 path) are simply read back out of the meta JSON file. This script
-  is purely about finding A4/A5B and sending mail.
+FILES INCLUDED
 
-A4 - THE FULL PRE-FILTER EXTRACT
-  A4_EXTRACTION_TMS_OCBA_YYMMDD.xlsx is created earlier in the
-  pipeline (before 04_validate.py splits it into A5/A5B) - it holds
-  every row of the batch before the Keep?-based filtering. This script
-  looks for that already-existing file in the same dated output folder
-  as A6 (given by the meta JSON) and, if found, attaches it to the
-  completion email alongside A6 and A5B, so the technician has the
-  full original extract, what got imported, and what got excluded all
-  in the same email. If no matching A4 is found, the email is still
-  sent without it, and a warning is printed/logged noting A4 was
-  expected but not found.
+A6 - Imported Records
+  The final import workbook created by 05_export.py. This is the
+  primary attachment and contains the records prepared for import into
+  TMS.
 
-A5B - THE "FLAGGED ITEMS" FILE
-  A5B_EXTRACTION_TMS_OCBA_YYMMDD.xlsx is created by 04_validate.py - it
-  holds the A4 rows that were EXCLUDED before A5/A6 (i.e. every row
-  whose 'Keep?' was NOT blank: NOT ASSET / NOT DEPLOYED / both), with
-  the same Keep?-based row colouring as A4. This script looks for that
-  already-existing file in the same dated output folder as A6 (given
-  by the meta JSON) and, if found, attaches it to the completion email
-  alongside A6, so both "what got imported" (A6) and "what got
-  excluded before that" (A5B) land in the same email. If no matching
-  A5B is found (e.g. 04_validate.py hasn't been run for this batch, or
-  ran before the output-folder naming changed), the email is still
-  sent with just A6 attached, and a warning is printed/logged noting
-  A5B was expected but not found.
+A4 - Full Pre-filter Extract
+  If present, the original batch extract is attached so the technician
+  has the complete source data alongside the final import file.
 
-EMAIL NOTIFICATION
-  This script ALWAYS sends one completion email using Python's
-  smtplib - whether the batch was fully clean or some rows need
-  review:
-    - All clean: a short success summary (counts only), with A6 as the
-      only required attachment (A4 and A5B are added on top whenever
-      they're found - see above).
-    - Some rows need review: the same summary, plus the detailed list
-      of which rows and why (Article Code Review, missing Location,
-      and/or duplicate Article Code), taken from the meta JSON. A4 and
-      A5B (found in the output folder, see above) are attached
-      whenever they exist, regardless of whether A6 itself has flagged
-      rows - they report different, earlier stages of the batch
-      (the full pre-filter extract, and the Keep? exclusions from
-      04_validate.py).
-  The email body always ends with an explicit "Attachments:" section
-  listing exactly which file(s) were actually attached (with size), or
-  explicitly saying a file was left out and why (missing / too large),
-  so the technician never has to guess what they were sent.
-  SMTP server/recipient settings live in config.conf under
-  [notifications] - fill those in with real values before this can
-  actually send. Until then, sending is skipped and the would-be email
-  content (including the Attachments section) is printed to the
-  console instead, if smtp_host is left blank.
+A5B - Excluded Records
+  If present, the workbook containing rows excluded during validation
+  is attached to provide visibility of records that were not included
+  in the import.
+
+KIT-ONLY ITEMS
+
+The script identifies rows in A5B marked only as 'NOT ASSET'. These
+represent Kit articles that reached a valid deployed mission but must
+be manually broken down into their component assets before being
+imported into TMS. Any such rows are listed in a dedicated section of
+the email for easy reference.
+
+EMAIL SUMMARY
+
+A single completion email is sent for every batch. The email includes:
+
+  - Overall batch statistics.
+  - Any Article Code Review, missing Location, or duplicate Article
+    Code warnings recorded during export.
+  - A dedicated Kit-only section when applicable.
+  - An Attachments section listing every file included with the email,
+    together with any expected files that could not be attached.
+
+SMTP server and recipient settings are read from the
+[notifications] section of config.conf.
 
 Usage:
     python 06_notify.py [path_to_A6_META_....json]
 
-If the meta-file path is omitted, the script looks in the dated output
-subfolders (same "Y26W26"-style convention 05_export.py writes into)
-for the most recently modified A6_META_EXTRACTION_TMS_OCBA_*.json.
+If no metadata file is supplied, the script automatically locates the
+most recently generated A6 metadata file in the output folders.
+```
 """
 import os
 import sys
 import glob
 import json
 import smtplib
+import pandas as pd
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -88,6 +67,13 @@ from email import encoders
 from common_config import load_config, get_paths
 
 MAX_ATTACHMENT_MB = 20  # most SMTP servers/relays reject attachments above ~20-25MB
+
+# Mirrors 03_clean_transform.py / 04_validate.py's Keep? reason string.
+# Needed here only to pull the "NOT ASSET only" rows back out of A5B
+# for the Kit call-out section below. Kept in sync manually, same as
+# the rest of this pipeline's per-script duplication.
+NOT_ASSET = "NOT ASSET"
+NOT_DEPLOYED = "NOT DEPLOYED"
 
 
 def find_latest_meta(output_dir):
@@ -147,7 +133,8 @@ def find_existing_a5b(output_dir, date_tag):
     so it can be attached to the completion email alongside A6.
 
     Returns the path if found, else None (with a console warning -
-    the email still goes out with just A6 attached in that case).
+    the email still goes out with just A6 attached, and no Kit call-out
+    section, in that case).
     """
     expected_path = os.path.join(output_dir, f"A5B_EXTRACTION_TMS_OCBA_{date_tag}.xlsx")
     if os.path.exists(expected_path):
@@ -156,13 +143,63 @@ def find_existing_a5b(output_dir, date_tag):
     print(f"  WARNING: expected A5B file not found at '{expected_path}'. "
           f"A5B is produced by 04_validate.py - make sure it was run for this "
           f"batch (date tag '{date_tag}') and wrote into this same output folder. "
-          f"Continuing without it - the email will only have A6 attached.")
+          f"Continuing without it - the email will only have A6 attached, and "
+          f"won't be able to list any Kit-only rows (see find_kit_only_rows()).")
     return None
+
+
+def find_kit_only_rows(a5b_path):
+    """
+    Pulls the "NOT ASSET only" rows back out of A5B for the completion
+    email's Kit call-out section (see module docstring).
+
+    A5B's 'Keep?' column can read "NOT ASSET", "NOT DEPLOYED", or
+    "NOT ASSET; NOT DEPLOYED" (see 03_clean_transform.py /
+    04_validate.py). We want ONLY the exact-match "NOT ASSET" rows
+    here - Kits that DID reach a valid, deployed TMS mission and so
+    still need to be manually exploded into their component assets and
+    imported. Rows also flagged "NOT DEPLOYED" are excluded from this
+    section: they never reached a valid mission in the first place, so
+    there is nothing to explode/import for TMS.
+
+    Returns a list of one-line summaries (e.g. "Article Code 'K1234ABC'
+    - Mission 'CF160MES' - Qty 3"), or an empty list if a5b_path is
+    None (A5B wasn't found), the file can't be read, or it has none of
+    the expected columns / no matching rows.
+    """
+    if not a5b_path or not os.path.exists(a5b_path):
+        return []
+
+    try:
+        df = pd.read_excel(a5b_path, dtype=str, keep_default_na=True)
+    except Exception as e:
+        print(f"  WARNING: could not read '{a5b_path}' to look for Kit-only rows ({e}). "
+              f"Skipping the Kit call-out section for this email.")
+        return []
+
+    if "Keep?" not in df.columns or "FCL_ART_CODE" not in df.columns:
+        print(f"  WARNING: '{a5b_path}' is missing the 'Keep?' and/or 'FCL_ART_CODE' "
+              f"column(s) - can't identify Kit-only rows. Skipping the Kit call-out "
+              f"section for this email.")
+        return []
+
+    keep_col = df["Keep?"].astype(str).str.strip()
+    kit_only_mask = keep_col == NOT_ASSET  # exact match only - excludes "NOT ASSET; NOT DEPLOYED"
+
+    lines = []
+    for _, row in df.loc[kit_only_mask].iterrows():
+        code = row.get("FCL_ART_CODE", "")
+        mission = row.get("PCT_CLI_CODE_LIV", "")
+        qty = row.get("QTE", "")
+        qty_str = f" - Qty {str(qty).strip()}" if pd.notna(qty) and str(qty).strip() else ""
+        lines.append(f"Article Code '{code}' - Mission '{mission}'{qty_str}")
+
+    return lines
 
 
 def build_completion_email(week_tag, date_tag, total_rows, n_clean, n_review, n_missing_location,
                             n_duplicate, review_rows_summary, missing_location_summary,
-                            duplicate_summary, a6_path, a5b_path, a4_path):
+                            duplicate_summary, a6_path, a5b_path, a4_path, kit_only_summary):
     """
     Builds ONE email that always reports the batch's outcome:
       - If everything is clean: a short success summary.
@@ -174,6 +211,14 @@ def build_completion_email(week_tag, date_tag, total_rows, n_clean, n_review, n_
     regardless of whether A6 itself needs review, since they reflect
     earlier, separate stages of the batch (the full pre-filter extract,
     and 04_validate.py's Keep? exclusions).
+
+    kit_only_summary (see find_kit_only_rows()) is always listed, in
+    its own section, whenever it's non-empty - independent of
+    needs_review - since these are Kits that reached a deployed
+    mission and still need a person to explode them into assets and
+    import those into TMS; that's actionable regardless of whether
+    anything else in the batch needs attention.
+
     (The actual Attachments section is appended later, in send_email,
     once it's known what was actually attached.)
 
@@ -230,6 +275,19 @@ def build_completion_email(week_tag, date_tag, total_rows, n_clean, n_review, n_
         if duplicate_summary:
             body_lines.append("Duplicate Article Code - details:")
             body_lines.extend(f"  - {line}" for line in duplicate_summary)
+
+    if kit_only_summary:
+        body_lines.append("")
+        body_lines.append(
+            f"Kit articles excluded from A6, sent to a deployed mission ({len(kit_only_summary)}):"
+        )
+        body_lines.append(
+            "  These are Kits (not individually flagged as undeployed) that reached a "
+            "valid TMS mission - explode each one into its component assets and import "
+            "those into TMS separately; the Kit line itself was excluded from A6 and is "
+            "never imported as a single asset."
+        )
+        body_lines.extend(f"  - {line}" for line in kit_only_summary)
 
     return subject, body_lines
 
@@ -378,11 +436,17 @@ def main():
     a4_path = find_existing_a4(meta["output_dir"], meta["date_tag"])
     a5b_path = find_existing_a5b(meta["output_dir"], meta["date_tag"])
 
+    kit_only_summary = find_kit_only_rows(a5b_path)
+    if kit_only_summary:
+        print(f"  Found {len(kit_only_summary)} Kit-only (NOT ASSET only) row(s) in A5B - "
+              f"listing them in their own section of the completion email.")
+
     subject, body_lines = build_completion_email(
         meta["week_tag"], meta["date_tag"], meta["total_rows"], meta["n_clean"],
         meta["n_review"], meta["n_missing_location"], meta["n_duplicate"],
         meta["review_rows_summary"], meta["missing_location_summary"],
         meta["duplicate_summary"], meta["a6_path"], a5b_path, a4_path,
+        kit_only_summary,
     )
     attachment_paths = (
         [meta["a6_path"]]

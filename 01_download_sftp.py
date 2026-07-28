@@ -1,35 +1,19 @@
 """
 01_download_sftp.py
 ---------------------
-Connects to the MSF Logistique SFTP server (SSH File Transfer Protocol,
-via paramiko) and downloads ONLY the latest extraction file on the
-server, provided that file's embedded date falls in the SAME ISO week
-(year + week number) as the day the script is run.
+Connects to the MSF Logistique SFTP server and downloads the latest
+available extraction file for processing.
 
-If the latest file is not from the current week (e.g. this week's
-extract hasn't landed on the server yet), the script stops WITHOUT
-downloading anything and exits with status 2 ("not ready yet" - a
-normal, expected outcome, not a failure), so it can be used safely in
-an automated/cron pipeline. See the EXIT_OK / EXIT_ERROR /
-EXIT_NOT_READY constants below for the full exit-code contract used by
-run_pipeline.py (the master script).
+The downloaded file is saved to the pipeline's download folder, along
+with a manifest file (downloaded_files.txt) recording the downloaded
+file for use by the next stage of the pipeline.
 
-Run this first. It writes the file into:
-    <download_root>/<week_tag>/
+The script verifies that the latest extraction is available before
+downloading it. If no new extraction is ready, it exits cleanly so the
+pipeline can be run again later without error.
 
-where week_tag is the ISO week BEFORE the one this script is RUN in
-(e.g. if run during ISO week 26, week_tag is "Y26W25" - see
-common_config.compute_week_tag() for why: the weekly extract for a
-given week only lands on the server, and gets processed, during the
-following week). This is the same folder-naming convention used by
-every later stage of this pipeline (02_read_files.py's work folder,
-04_validate.py's A5B output, 05_export.py's A6 output), so a batch's
-files stay organized under one consistent folder name across the
-whole run. Also writes a manifest (downloaded_files.txt) into that
-same folder listing what was pulled, so script 02 knows exactly what
-to read next.
-
-Requires: paramiko (pip install paramiko)
+Requires:
+    paramiko
 
 Usage:
     python 01_download_sftp.py

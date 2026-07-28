@@ -1,64 +1,46 @@
 """
 04_validate.py
 ----------------
-The script takes this batch's A4 workbook,
-extracts only the rows where 'Keep?' is BLANK (i.e. rows that haven't
-already been disqualified by the Family/customer/Mission checks in
-03_clean_transform.py), and checks each row's FCL_ART_CODE against the
-known article codes in the TMS article export.
+Processes this batch's A4 workbook by selecting rows where the
+'Keep?' column is blank and validating each row's FCL_ART_CODE
+against the TMS article list.
 
-Reproduces spec section 4, step 10 ("Check that all article codes are
-available in TMS"), simplified to its core check for now:
+ARTICLE CODE VALIDATION
 
-  - FCL_ART_CODE found in the TMS article list -> "Checked"
-  - FCL_ART_CODE NOT found (the spec's "N/A" case) -> "Review"
+Each article code is checked against the reference data in
+templates/TMS_UniDataArticles.xlsx:
 
-The TMS article list itself lives in a separate, easily-replaceable
-file: templates/TMS_UniDataArticles.xlsx (re-export this from TMS
-whenever you need fresher data - the column this script reads is
-"Article Code", same as the TMS_UniDataArticles tab inside the B
-template). No code changes needed to refresh it.
+  - Article code found -> "Checked"
+  - Article code not found -> "Review"
 
-ARTICLE COMPOSE SUBSTITUTION (new):
-Some MSF Logistique "Kit" articles are exported WITHOUT the leading
-'K' that normally identifies a Kit family (see 03_clean_transform.py's
-Family/NOT ASSET check). Because they don't have that leading 'K',
-they pass the Family check as normal assets, but their raw
-FCL_ART_CODE does not match how TMS lists them - so without a fix
-they'd always come back "Review" even when TMS does recognize them.
+ARTICLE COMPOSE LOOKUP
 
-templates/ArticleCompose.xlsx documents these: column "Article" is the
-raw code as it appears in the extraction, column "ArticleCompose" is
-the code TMS actually uses for the same item. Before the TMS check, we
-look up each row's FCL_ART_CODE in the "Article" column; on a match we
-replace FCL_ART_CODE with the "ArticleCompose" value so the TMS check
-runs against the code TMS actually recognizes.
+Some article codes require conversion before they can be matched
+against the TMS article list. The script uses
+templates/ArticleCompose.xlsx to substitute these codes with their
+corresponding TMS article codes before performing validation.
 
-Output:
-  - A5_EXTRACTION_TMS_OCBA_YYMMDD.xlsx, in the SAME dated work folder
-    as A4, containing only the blank-Keep? rows from A4 plus
-    "Article Code Check" ("Checked" / "Review"), with conditional
-    formatting keyed off that column but applied to the ENTIRE ROW
-    (green for Checked, red for Review), so a flagged row is obvious
-    at a glance across all its fields, not just in that one column.
-  - A5B_EXTRACTION_TMS_OCBA_YYMMDD.xlsx, written to the configured
-    output_dir's <week_tag>/ subfolder (config.conf [local] output_dir,
-    e.g. output/Y26W25/ - tagged with the ISO week BEFORE the one this
-    script is RUN in, not the batch's own date tag - see
-    resolve_output_dir() / common_config.compute_week_tag()). This is
-    the same folder 05_export.py later writes A6 into, and from which
-    06_notify.py emails A5B alongside A6. Contains the rows EXCLUDED
-    from A5 (i.e. every A4 row whose Keep? was NOT blank). Keeps the
-    same Keep?-based conditional formatting used on A4, unchanged.
+OUTPUT
+
+The script creates two workbooks:
+
+  - A5_EXTRACTION_TMS_OCBA_YYMMDD.xlsx
+      Contains all rows where 'Keep?' is blank, together with the
+      "Article Code Check" result. Rows are colour-coded to highlight
+      validation status:
+          - Green: Checked
+          - Red: Review
+
+  - A5B_EXTRACTION_TMS_OCBA_YYMMDD.xlsx
+      Contains all rows excluded from A5 (those where 'Keep?' is not
+      blank). The workbook retains the same row colouring applied in
+      A4 to indicate why each record was excluded.
 
 Usage:
-    python 04_validate.py [path_to_A4_workbook.xlsx] [path_to_tms_article_list.xlsx] [path_to_article_compose.xlsx]
+    python 04_validate.py [path_to_A4_workbook.xlsx]
 
-If the A4 path is omitted, the script looks in the dated work
-subfolders (same convention as 03_clean_transform.py) for the most
-recent A4_*.xlsx. If the TMS article list / article compose paths are
-omitted, the paths in config.conf ([templates] tms_article_list_path /
-article_compose_path) are used.
+If no A4 workbook is supplied, the script automatically selects the
+most recent A4 file.
 """
 import os
 import sys
@@ -82,23 +64,11 @@ ARTICLE_COMPOSE_TARGET_COL = "ArticleCompose"
 CHECKED = "Checked"
 REVIEW = "Review"
 
-# Mirrors 03_clean_transform.py's Keep? reason strings, needed here only
-# to reproduce the same conditional-formatting rules on A5B (the
-# excluded-rows workbook). Kept in sync manually, same as the rest of
-# this pipeline's per-script duplication (see find_latest_a4 vs
-# find_latest_a3).
 NOT_ASSET = "NOT ASSET"
 NOT_DEPLOYED = "NOT DEPLOYED"
 
 
 def find_latest_a4(work_dir):
-    """
-    Same convention as 03_clean_transform.py's find_latest_a3(): prefer
-    the most recently modified A4 found INSIDE a dated subfolder under
-    work_dir. A flat work_dir/A4_....xlsx (not inside a dated folder)
-    is only used as a last-resort fallback, and is flagged as
-    potentially stale.
-    """
     subfolders = [f for f in glob.glob(os.path.join(work_dir, "*")) if os.path.isdir(f)]
     subfolders.sort(key=os.path.getmtime, reverse=True)
     for folder in subfolders:
@@ -128,15 +98,6 @@ def find_latest_a4(work_dir):
 
 
 def resolve_template_path(path):
-    """
-    Look for a template file at the exact given path first. If not
-    found, fall back to a case-insensitive filename match in the same
-    folder - real exports/templates have been seen with inconsistent
-    capitalization (e.g. "TMS_UNiDataArticles.xlsx"), and re-exports
-    may vary in casing again later. Avoids a confusing
-    FileNotFoundError over what is really just a capitalization
-    mismatch. Used for both the TMS article list and ArticleCompose.
-    """
     if os.path.exists(path):
         return path
 
@@ -172,15 +133,6 @@ def load_tms_article_codes(path):
 
 
 def load_article_compose_map(path):
-    """
-    Load the raw-code -> TMS-composed-code lookup for "hidden" Kit
-    articles (see module docstring). Returns a dict, e.g.
-        {"EEMDCONA1200": "EEMDCONE12-", ...}
-    Required, same as the TMS article list - if this file is missing
-    or malformed we stop rather than silently skip the substitution,
-    since that would just make those rows come back "Review" for the
-    wrong reason.
-    """
     path = resolve_template_path(path)
     if not os.path.exists(path):
         raise FileNotFoundError(
@@ -206,12 +158,6 @@ def load_article_compose_map(path):
 
 
 def apply_article_compose(blank_df, compose_map):
-    """
-    For rows whose FCL_ART_CODE matches a key in compose_map, replace
-    it with the composed/TMS-recognized code before the TMS check.
-
-    Returns the modified dataframe and the number of rows substituted.
-    """
     raw_codes = blank_df["FCL_ART_CODE"].astype(str).str.strip()
     composed = raw_codes.map(compose_map)
     matched_mask = composed.notna()
@@ -224,15 +170,6 @@ def apply_article_compose(blank_df, compose_map):
 
 
 def add_article_check_conditional_formatting(ws, n_rows, n_cols, check_col_idx):
-    """
-    Color the ENTIRE ROW based on 'Article Code Check': green for
-    Checked, red for Review - not just the check-column cell itself,
-    so a flagged row is obvious at a glance across all its fields.
-    Formula-based with an absolute column / relative row reference
-    (same pattern as add_keep_conditional_formatting's Keep?-based row
-    highlighting on A5B), so it stays correct if rows are re-sorted or
-    edited later.
-    """
     check_col_letter = get_column_letter(check_col_idx)
     last_col_letter = get_column_letter(n_cols)
     data_range = f"A2:{last_col_letter}{n_rows}"
@@ -257,6 +194,13 @@ def add_keep_conditional_formatting(ws, n_rows, n_cols, keep_col_idx):
     reproduced here so A5B (the excluded-rows workbook) keeps the exact
     same Keep?-based row coloring that A4 has. See that script for the
     rule rationale.
+
+    Kit rows use a purple/lavender fill (CC99FF) instead of orange -
+    orange sat too close to the yellow "NOT DEPLOYED" fill to tell
+    apart at a glance. The "pending" fill is a medium gray (BFBFBF)
+    rather than a near-white, which was practically invisible against
+    the sheet's white background. Kept in sync manually with
+    03_clean_transform.py.
     """
     keep_col_letter = get_column_letter(keep_col_idx)
     last_col_letter = get_column_letter(n_cols)
@@ -264,9 +208,9 @@ def add_keep_conditional_formatting(ws, n_rows, n_cols, keep_col_idx):
     ref_cell = f"${keep_col_letter}2"
 
     fill_both = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    fill_not_asset = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
+    fill_not_asset = PatternFill(start_color="CC99FF", end_color="CC99FF", fill_type="solid")
     fill_not_deployed = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
-    fill_pending = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+    fill_pending = PatternFill(start_color="BFBFBF", end_color="BFBFBF", fill_type="solid")
 
     rules = [
         FormulaRule(
@@ -292,12 +236,6 @@ def add_keep_conditional_formatting(ws, n_rows, n_cols, keep_col_idx):
 
 
 def _write_table_workbook(df, out_path, sheet_title):
-    """
-    Shared workbook-writing mechanics (table + column widths + text
-    formatting for lot/serial numbers) used by both A5 and A5B. Does
-    NOT apply conditional formatting - callers add whichever rules fit
-    their own sheet after this returns.
-    """
     wb = Workbook()
     ws = wb.active
     ws.title = sheet_title[:31]
@@ -370,15 +308,6 @@ def save_a5b_xlsx(df, output_dir, date_tag):
 
 
 def resolve_output_dir(paths):
-    """
-    Destination for A5B (and later A6, written by 05_export.py) - the
-    folder these get emailed from. Uses the configured output_dir from
-    config.conf ([local] output_dir), with a subfolder named after the
-    shared week_tag convention (e.g. "Y26W25" - the ISO week BEFORE the
-    one this script is run in, per common_config.compute_week_tag()),
-    NOT the batch's own date tag, so batches processed in the same
-    week share a folder with 05_export.py's A6 output.
-    """
     week_tag = compute_week_tag()
     output_dir = get_dated_subdir(paths["output_dir"], week_tag)
     return output_dir, week_tag

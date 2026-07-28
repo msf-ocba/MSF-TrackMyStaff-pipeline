@@ -1,54 +1,38 @@
 """
 02_read_files.py
 ------------------
-Finds the SINGLE latest extraction file (by YYMMDD embedded in its
-filename) across ALL folders under download_root, and reproduces the
-manual pre-processing steps from spec section 4 ("File pre-processing"),
-steps 3-6, on that one file only:
+Processes the latest MSF Logistique extraction and prepares it for the
+rest of the pipeline.
 
-  3. Save/rename as A1_EXTRACTION_TMS_OCBA_YYMMDD.csv
-  4. Create a file copy, rename it, change extension to .txt:
-     A2_EXTRACTION_TMS_OCBA_YYMMDD.txt
-  5. "Open this txt file with Excel & Transform it via text import
-     wizard: check 'Delimited' > Next > check only 'semicolon' > Next
-     > Select column for Serial Numbers (PCL_NO_SERIE_LOT) and choose
-     'Text' > Finish"
-     -> Replicated by parsing the semicolon-delimited file and forcing
-        PCL_NO_SERIE_LOT to text.
-  6. Create a table with headers, save as xlsx:
-     A3_EXTRACTION_TMS_OCBA_YYMMDD.xlsx
+The script locates the most recent extraction file (based on the
+YYMMDD date in its filename) or processes a specified file if one is
+provided.
 
-IMPORTANT: MSF Logistique extractions are weekly snapshots
-identified by the YYMMDD in their filename, and each week's batch is
-processed entirely on its own. So this script:
-  - scans every file under download_root (all dated download subfolders)
-  - picks the ONE file with the latest YYMMDD in its name
-  - processes only that file
+PROCESSING
 
-work_dir and output_dir are dated per BATCH RUN, using the ISO week
-BEFORE the one this script is executed in (e.g. work/Y26W25/ if run
-during week 26 - see common_config.compute_week_tag()), not the YYMMDD
-embedded in the source filename - this matches the same week-tag
-convention used by 04_validate.py and 05_export.py for their own
-output folders, so every stage of the pipeline organizes its files the
-same way. A1,
-A2, A3 (and later A4, A5, A6) filenames still embed the batch's own
-YYMMDD date tag, taken from the source filename - only the FOLDER name
-changed. Every batch processed in the same calendar week lands in the
-same work folder; the A-prefixed filenames (which include the date
-tag) are what keep different batches from colliding within that folder.
+The source CSV is converted into the standard working files used by the
+subsequent scripts:
 
-Source files are semicolon-delimited, double-quoted, ISO-8859-1
-("latin1") encoded, with comma decimal separators (e.g. "2081,40") and
-DD/MM/YYYY dates - this matches the real MSF Logistique export format.
+  - A1_EXTRACTION_TMS_OCBA_YYMMDD.csv
+      A renamed copy of the original extraction.
+
+  - A2_EXTRACTION_TMS_OCBA_YYMMDD.txt
+      A text version of the extraction used for import into Excel.
+
+  - A3_EXTRACTION_TMS_OCBA_YYMMDD.xlsx
+      An Excel workbook created from the source data, with the
+      PCL_NO_SERIE_LOT (Serial Number) column imported as text to
+      preserve its original values.
+
+The source extraction is expected to be semicolon-delimited and encoded
+using ISO-8859-1 (Latin-1), matching the standard MSF Logistique export
+format.
 
 Usage:
-    python 02_read_files.py [path_to_specific_file.csv]
+    python 02_read_files.py [path_to_extraction.csv]
 
-If a specific file path is given, that file is used directly (its
-YYMMDD is still parsed from its filename to name the A1/A2/A3 outputs).
-If omitted, the latest file by YYMMDD across download_root is
-auto-selected.
+If no file is specified, the script automatically selects the most
+recent extraction available.
 """
 import os
 import re

@@ -1,0 +1,72 @@
+; SFTP connection settings for MSF Logistique extraction server
+; Fill in real values and keep this file OUT of version control
+
+[sftp]
+#host =
+host =
+port =
+user =
+password =
+
+; If MSF Logistique instead gives you a private key for auth, leave
+; password blank and set this to the key file path (password is then
+; only used as the key's passphrase, if any).
+private_key_path =
+
+; Remote directory where extraction files are dropped (see doc: "/to/depot")
+remote_dir = /to/depot
+
+; Only files matching this prefix/suffix are considered
+; (per spec: EXTRACTION_TMS_OCBA_YYMMDD.csv)
+file_prefix = EXTRACTION_TMS_OCBA_
+file_suffix = .csv
+
+[local]
+; Where downloaded files land (one sub-folder per run, dated)
+download_root = ./downloads
+
+; Where intermediate / output files are written
+work_dir = ./work
+output_dir = ./output
+
+[extraction_rules]
+; FCT_CLI_CODE_FAC value that identifies OCBA (see spec rule 1)
+customer_code = ES001MES
+
+; Article family/group code to exclude (spec rule 7: 'Library')
+excluded_art_faa_code = L
+
+[templates]
+; Local copy of the TMS article export (used by 04_validate.py to check
+; FCL_ART_CODE against known TMS article codes). Re-export this from
+; TMS and overwrite the file whenever you need fresher data - no code
+; changes needed. Must keep an "Article Code" column.
+tms_article_list_path = ./templates/TMS_UniDataArticles.xlsx
+
+; Local copy of the "Transit In" location list (used by 05_export.py to
+; map each row's Project Code prefix to a full TMS location path).
+; One full location path per row, e.g.
+; "OCBA/Assets/CAR/CF101-Bangui-Coordination/VL_Transit_IN". Re-export/
+; overwrite this file whenever missions or locations change.
+location_list_path = ./templates/location.xlsx
+
+; Editable allowlist of valid Mission Code prefixes (used by
+; 03_clean_transform.py's Keep? check). One 2-character prefix per
+; line, # for comments.
+mission_code_prefixes_path = ./templates/Mission_code_prefixes.txt
+
+[notifications]
+; Email settings for 05_export.py's review notification. Leave
+; smtp_host blank to skip sending real email - the script will just
+; print the notification content to the console instead.
+smtp_host = smtp.gmail.com
+smtp_port = 587
+smtp_user =
+smtp_password =
+use_tls = true
+
+; Who the notification appears to come from (defaults to smtp_user if blank)
+from_address =
+
+; Comma-separated list of recipients, e.g. tech1@example.org, tech2@example.org
+to_addresses = 
