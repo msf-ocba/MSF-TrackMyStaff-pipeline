@@ -362,7 +362,7 @@ def main():
     output_path = save_to_output_dir(a4_path, paths)
     print(f"A4 workbook also sent to output folder: {output_path}")
 
-    print("\nNext step: pending further guidance on processing A4.")
+    print("\nNext step: run 04_validate.py")
 
 
 if __name__ == "__main__":

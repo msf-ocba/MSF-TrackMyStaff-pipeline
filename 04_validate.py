@@ -385,7 +385,7 @@ def main():
     a5b_path = save_a5b_xlsx(excluded_df, output_dir, date_tag)
     print(f"A5B workbook (excluded rows) saved to: {a5b_path}  (output folder: {week_tag})")
 
-    print("\nNext step: pending further guidance on processing A5 / assembling A6.")
+    print("\nNext step: run 05_export.py")
 
 
 if __name__ == "__main__":
