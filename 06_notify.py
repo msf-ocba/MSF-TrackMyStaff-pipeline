@@ -1,14 +1,33 @@
 """
 06_notify.py
 --------------
-Sends the batch completion email after 05_export.py has finished.
+Sends the batch completion email after 04_validate.py or 05_export.py
+has finished.
 
-The script reads the metadata JSON created alongside A6
-(A6_META_EXTRACTION_TMS_OCBA_YYMMDD.json), uses it to locate the
-generated output files, and sends a single completion email summarising
-the batch.
+The script reads a batch meta JSON and uses it to locate the generated
+output files, then sends a single completion email summarising the
+batch. Two kinds of meta file are recognised:
 
-FILES INCLUDED
+  - A6_META_EXTRACTION_TMS_OCBA_YYMMDD.json
+      Written by 05_export.py after producing A6 - the normal case.
+      Triggers the full completion email described below (batch
+      statistics, Article Code Review / Location / duplicate warnings,
+      Kit-only section, attachments).
+
+  - A5_META_EXTRACTION_TMS_OCBA_YYMMDD.json
+      Written by 04_validate.py instead, when a batch has ZERO rows
+      with a blank 'Keep?' - i.e. nothing new to import into TMS this
+      run (every row was already "NOT ASSET" / "NOT DEPLOYED" / both).
+      There is no A6 for this batch. Triggers a distinct, shorter
+      "nothing to import" email instead - still attaching A4/A5B so
+      the batch is fully accounted for - since technicians rely on
+      getting an email either way, not on checking server logs to see
+      whether the pipeline ran.
+
+Whichever meta file is most recently modified is used automatically;
+see find_latest_meta().
+
+FILES INCLUDED (normal / A6 case)
 
 A6 - Imported Records
   The final import workbook created by 05_export.py. This is the
@@ -43,15 +62,19 @@ A single completion email is sent for every batch. The email includes:
   - An Attachments section listing every file included with the email,
     together with any expected files that could not be attached.
 
+(For the "nothing to import" case - see A5_META_....json above - the
+email is a shorter, distinct summary instead; see
+build_nothing_to_import_email().)
+
 SMTP server and recipient settings are read from the
 [notifications] section of config.conf.
 
 Usage:
-    python 06_notify.py [path_to_A6_META_....json]
+    python 06_notify.py [path_to_meta_json]
 
 If no metadata file is supplied, the script automatically locates the
-most recently generated A6 metadata file in the output folders.
-```
+most recently generated meta file (A6_META_... or A5_META_...) in the
+output folders.
 """
 import os
 import sys
@@ -75,21 +98,36 @@ MAX_ATTACHMENT_MB = 20  # most SMTP servers/relays reject attachments above ~20-
 NOT_ASSET = "NOT ASSET"
 NOT_DEPLOYED = "NOT DEPLOYED"
 
+# Glob patterns for the two kinds of meta file this script understands
+# - see the module docstring for what each means.
+META_PATTERNS = (
+    "A6_META_EXTRACTION_TMS_OCBA_*.json",
+    "A5_META_EXTRACTION_TMS_OCBA_*.json",
+)
+
 
 def find_latest_meta(output_dir):
     """
     Same dated-subfolder convention as 05_export.py's find_latest_a5():
     looks in the most recently modified dated subfolder(s) under
-    output_dir for an A6_META_EXTRACTION_TMS_OCBA_*.json file.
+    output_dir for a meta file. Both A6_META_....json (normal case)
+    and A5_META_....json ("nothing to import" case - see module
+    docstring) are considered together; whichever individual file is
+    most recently modified wins, so a same-week rerun always picks up
+    the latest outcome regardless of which kind of batch it was.
     """
     subfolders = [f for f in glob.glob(os.path.join(output_dir, "*")) if os.path.isdir(f)]
     subfolders.sort(key=os.path.getmtime, reverse=True)
     for folder in subfolders:
-        candidates = sorted(glob.glob(os.path.join(folder, "A6_META_EXTRACTION_TMS_OCBA_*.json")))
+        candidates = []
+        for pattern in META_PATTERNS:
+            candidates.extend(glob.glob(os.path.join(folder, pattern)))
         if candidates:
             return max(candidates, key=os.path.getmtime)
 
-    direct = sorted(glob.glob(os.path.join(output_dir, "A6_META_EXTRACTION_TMS_OCBA_*.json")))
+    direct = []
+    for pattern in META_PATTERNS:
+        direct.extend(glob.glob(os.path.join(output_dir, pattern)))
     if direct:
         chosen = max(direct, key=os.path.getmtime)
         print(f"  WARNING: no dated subfolder under '{output_dir}' contains a meta file. "
@@ -97,8 +135,10 @@ def find_latest_meta(output_dir):
         return chosen
 
     raise FileNotFoundError(
-        f"No A6_META_EXTRACTION_TMS_OCBA_*.json file found under '{output_dir}' "
-        f"(checked dated subfolders and the flat folder). Run 05_export.py first."
+        f"No A6_META_EXTRACTION_TMS_OCBA_*.json or A5_META_EXTRACTION_TMS_OCBA_*.json "
+        f"file found under '{output_dir}' (checked dated subfolders and the flat "
+        f"folder). Run 05_export.py (or, for a batch with nothing to import, "
+        f"04_validate.py) first."
     )
 
 
@@ -227,6 +267,9 @@ def build_completion_email(week_tag, date_tag, total_rows, n_clean, n_review, n_
     and body still name the batch's own date_tag (e.g. "260629") for
     precise identification, since more than one batch can land in the
     same week folder.
+
+    NOTE: this is the "normal" (A6) email. For a batch with zero rows
+    to import, see build_nothing_to_import_email() instead.
     """
     needs_review = bool(n_review or n_missing_location or n_duplicate)
 
@@ -292,21 +335,68 @@ def build_completion_email(week_tag, date_tag, total_rows, n_clean, n_review, n_
     return subject, body_lines
 
 
+def build_nothing_to_import_email(week_tag, date_tag, total_rows, a5b_path, a4_path):
+    """
+    Completion email for a batch where 04_validate.py found zero rows
+    with a blank 'Keep?' - there was nothing new to import into TMS
+    this run (every row was already "NOT ASSET" / "NOT DEPLOYED" /
+    both). No A6 exists for this batch, so this is a distinct, shorter
+    email from build_completion_email() above: it confirms the batch
+    ran, explains why nothing was imported, and still attaches
+    A4/A5B so every source row is accounted for without anyone having
+    to check server logs.
+    """
+    subject = f"[MSF TMS Import] {week_tag} - Batch {date_tag} - nothing to import"
+    headline = (
+        f"Batch {date_tag} (folder {week_tag}) ran successfully, but had nothing new "
+        f"to import into TMS: all {total_rows} row(s) in this batch already had a "
+        f"non-blank 'Keep?' (e.g. 'NOT ASSET' and/or 'NOT DEPLOYED')."
+    )
+
+    body_lines = [
+        headline,
+        "",
+        f"Total items in this batch: {total_rows}",
+        "Items imported into TMS (A6): 0 - no A6 file was produced this run.",
+        "",
+    ]
+
+    if a4_path:
+        body_lines.append(f"A4 (full pre-filter extract) file: {a4_path}")
+    else:
+        body_lines.append("A4 (full pre-filter extract): not found for this batch")
+
+    if a5b_path:
+        body_lines.append(f"A5B (excluded rows from 04_validate.py) file: {a5b_path}")
+    else:
+        body_lines.append("A5B (excluded rows from 04_validate.py): not found for this batch")
+
+    body_lines.append("")
+    body_lines.append(
+        "No action is needed unless this is unexpected - if you were expecting new "
+        "items this week, check A4/A5B (attached) for what came in and why every row "
+        "was excluded."
+    )
+
+    return subject, body_lines
+
+
 def send_email(cfg, subject, body_lines, attachment_paths=None):
     """
-    Shared SMTP sender used for the batch completion email. Until
-    [notifications] smtp_host is filled in in config.conf, this just
-    prints the would-be email content (including the Attachments
-    section below) to the console instead of sending anything - safe
-    to run as-is.
+    Shared SMTP sender used for every completion email this script
+    sends. Until [notifications] smtp_host is filled in in
+    config.conf, this just prints the would-be email content
+    (including the Attachments section below) to the console instead
+    of sending anything - safe to run as-is.
 
     attachment_paths, if given, is a list of files to attach as-is
-    (e.g. A6 and, when found in the output folder, A5B). Each one is
-    skipped with a warning if the file is missing or larger than
-    MAX_ATTACHMENT_MB. Regardless of what actually gets attached, the
-    email body always gets an explicit "Attachments:" section listing
-    exactly what was (and wasn't) sent, so the technician never has to
-    guess from the subject line alone.
+    (e.g. A6 and, when found in the output folder, A5B/A4 - or, for a
+    "nothing to import" batch, just A4/A5B). Each one is skipped with
+    a warning if the file is missing or larger than MAX_ATTACHMENT_MB.
+    Regardless of what actually gets attached, the email body always
+    gets an explicit "Attachments:" section listing exactly what was
+    (and wasn't) sent, so the technician never has to guess from the
+    subject line alone.
     """
     attachment_paths = attachment_paths or []
 
@@ -413,6 +503,34 @@ def _print_email_fallback(subject, body_lines):
     print("  --- end email content ---\n")
 
 
+def _handle_nothing_to_import(cfg, meta, meta_path):
+    """
+    Handles the A5_META_....json case (see module docstring): a batch
+    where 04_validate.py found nothing to import. Sends the shorter
+    "nothing to import" email and returns.
+    """
+    required = ["week_tag", "date_tag", "output_dir", "total_rows", "a5b_path", "a4_path"]
+    missing = [k for k in required if k not in meta]
+    if missing:
+        raise KeyError(f"Meta file '{meta_path}' is missing expected field(s): {missing}.")
+
+    a4_path = meta["a4_path"]
+    if a4_path and not os.path.exists(a4_path):
+        print(f"  WARNING: A4 file recorded in meta ('{a4_path}') no longer exists. Continuing without it.")
+        a4_path = None
+
+    a5b_path = meta["a5b_path"]
+    if a5b_path and not os.path.exists(a5b_path):
+        print(f"  WARNING: A5B file recorded in meta ('{a5b_path}') no longer exists. Continuing without it.")
+        a5b_path = None
+
+    subject, body_lines = build_nothing_to_import_email(
+        meta["week_tag"], meta["date_tag"], meta["total_rows"], a5b_path, a4_path
+    )
+    attachment_paths = ([a4_path] if a4_path else []) + ([a5b_path] if a5b_path else [])
+    send_email(cfg, subject, body_lines, attachment_paths=attachment_paths)
+
+
 def main():
     cfg = load_config()
     paths = get_paths(cfg)
@@ -423,6 +541,13 @@ def main():
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
+
+    if meta.get("outcome") == "nothing_to_import":
+        _handle_nothing_to_import(cfg, meta, meta_path)
+        print("\nDone. If SMTP wasn't configured yet, the notification content was "
+              "printed above instead of sent - fill in [notifications] in config.conf "
+              "to enable real emails.")
+        return
 
     required = [
         "week_tag", "date_tag", "output_dir", "total_rows", "n_clean", "n_review",

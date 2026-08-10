@@ -14,8 +14,13 @@ Text Import Wizard → manual filtering → manual lookups → manual email).
 02_read_files.py       → converts it to A1 (csv) → A2 (txt) → A3 (xlsx table)
 03_clean_transform.py  → adds Family / Keep? columns           → A4
 04_validate.py         → checks Article Codes against TMS      → A5 / A5B
+                          (or, if nothing to import: A5B + A5_META only)
 05_export.py           → maps to the TMS import template        → A6 / meta.json
+                          (skipped if 04 found nothing to import)
 06_notify.py           → sends the batch completion email
+                          (always runs when there's a batch to report on -
+                          either the normal A6 summary, or a shorter
+                          "nothing to import" email - see below)
 ```
 
 `run_pipeline.py` is the production entry point that runs all six steps
@@ -35,10 +40,33 @@ tag is preserved in every derived file for that batch:
 | `A2_EXTRACTION_TMS_OCBA_YYMMDD.txt` | `02` | Text-import-wizard equivalent |
 | `A3_EXTRACTION_TMS_OCBA_YYMMDD.xlsx` | `02` | Excel table, Serial Number forced to text |
 | `A4_EXTRACTION_TMS_OCBA_YYMMDD.xlsx` | `03` | + `Family` and `Keep?` columns |
-| `A5_EXTRACTION_TMS_OCBA_YYMMDD.xlsx` | `04` | Rows with blank `Keep?` + Article Code Check |
-| `A5B_EXTRACTION_TMS_OCBA_YYMMDD.xlsx` | `04` | Rows excluded by `Keep?` (kept for visibility) |
+| `A5_EXTRACTION_TMS_OCBA_YYMMDD.xlsx` | `04` | Rows with blank `Keep?` + Article Code Check. **Not produced** if zero rows have a blank `Keep?` — see "Nothing to import" below |
+| `A5B_EXTRACTION_TMS_OCBA_YYMMDD.xlsx` | `04` | Rows excluded by `Keep?` (kept for visibility). Always produced whenever there's at least one excluded row |
+| `A5_META_EXTRACTION_TMS_OCBA_YYMMDD.json` | `04` | **Only** produced when A5 is skipped (nothing to import) — lighter handoff summary for `06_notify.py`, see below |
 | `A6_EXTRACTION_TMS_OCBA_YYMMDD.xlsx` | `05` | **Final TMS import file** |
 | `A6_META_EXTRACTION_TMS_OCBA_YYMMDD.json` | `05` | Handoff summary used by `06_notify.py` |
+
+### Nothing to import
+
+Some batches have zero rows with a blank `Keep?` — every item was
+already excluded as a Kit (`NOT ASSET`), undeployed (`NOT DEPLOYED`), or
+both. In that case there's nothing new for TMS, so the pipeline doesn't
+try to build an empty A5/A6:
+
+- `04_validate.py` skips the article-code/TMS lookup entirely, still
+  writes `A5B` (so the excluded rows remain visible for the audit
+  trail), writes `A5_META_....json` instead of `A5`, and exits with
+  code `3` ("nothing to import" — not an error).
+- `run_pipeline.py` sees exit code `3`, skips `05_export.py` (nothing
+  to export), and runs `06_notify.py` directly. Users depend on
+  getting a completion email either way, not on checking server logs,
+  so the email still goes out — just a shorter one confirming the
+  batch ran and explaining why nothing was imported, with A4/A5B
+  attached for reference.
+- Running `04_validate.py` by hand in this situation also exits `3`;
+  running `06_notify.py` afterward (or letting `run_pipeline.py` do it)
+  picks up `A5_META_....json` automatically, the same way it normally
+  picks up `A6_META_....json`.
 
 ### Folder tag vs. file tag
 
@@ -105,6 +133,13 @@ Splits A4 by `Keep?`:
   first) → **A5**, with `Article Code Check` = `Checked`/`Review`.
 - Non-blank rows → **A5B**, keeping A4's original colour-coding.
 
+If there are zero blank rows, A5 and the article-code lookup are
+skipped entirely — see "Nothing to import" above. A5B is still written.
+
+Exit codes: `0` A5 produced normally, `3` nothing to import this run
+(not an error — see above), and a real failure otherwise (uncaught
+exception).
+
 ### 05 — `05_export.py`
 Maps A5 onto the TMS import template's column layout → **A6**, the file
 actually imported into TMS. Also runs three checks (informational only,
@@ -120,13 +155,22 @@ Rows are colour-coded (green/clean, yellow/review, orange/missing
 location, red/duplicate — most severe wins). `Model` is truncated to 50
 characters (TMS's own import limit). A companion
 `A6_META_EXTRACTION_TMS_OCBA_YYMMDD.json` records the batch stats for
-`06_notify.py`.
+`06_notify.py`. Not run at all if `04_validate.py` found nothing to
+import that batch.
 
 ### 06 — `06_notify.py`
-Reads the meta JSON, attaches A6 (+ A4 and A5B if present), and sends
-one completion email summarising the batch — including a dedicated
-section for Kit articles that reached a deployed mission and still need
-manual breakdown into component assets before import.
+Reads the most recent meta JSON — either `A6_META_....json` (the normal
+case, written by `05_export.py`) or `A5_META_....json` (the "nothing to
+import" case, written by `04_validate.py` instead — see above) — and
+sends one completion email:
+
+- **Normal case:** attaches A6 (+ A4 and A5B if present) and summarises
+  the batch, including a dedicated section for Kit articles that
+  reached a deployed mission and still need manual breakdown into
+  component assets before import.
+- **Nothing-to-import case:** a shorter email confirming the batch ran,
+  explaining that every row already had a non-blank `Keep?`, and
+  attaching A4/A5B (no A6 exists for this batch).
 
 If `[notifications] smtp_host` is blank in `config.conf`, the email
 content is printed to the console instead of sent — safe to run before
@@ -153,16 +197,21 @@ python run_pipeline.py --dry-run
 
 | Code | Meaning |
 |---|---|
-| `0` | Full success, OR nothing new to process yet, OR another run was already in progress (lock held) — none need a human |
-| `1` | A real failure in steps 01–05 — A6 may be missing/stale, needs investigation |
-| `2` | Steps 01–05 succeeded (A6 is valid and importable) but the completion email (06) failed — lower urgency; re-run `python 06_notify.py` once fixed |
+| `0` | Full success (including the completion email, whether it was the normal A6 summary or a "nothing to import" email), OR nothing new to process yet from SFTP, OR another run was already in progress (lock held) — none need a human |
+| `1` | A real failure in steps 01–04, or in 05 when there was something to export — A6 may be missing/stale, needs investigation |
+| `2` | The data pipeline succeeded (A6 was produced and is importable, or the batch genuinely had nothing to import) but the completion email (06) failed — lower urgency; re-run `python 06_notify.py` once fixed |
+
+Note that a "nothing to import" batch (04_validate.py exit code 3)
+still results in `run_pipeline.py` running `06_notify.py` — 05 is the
+only step skipped, since there's nothing for it to export.
 
 The pipeline takes an exclusive lock (`.pipeline.lock`) so overlapping
 cron runs can't process the same batch twice, and each step gets a
 30-minute timeout so a hung SFTP connection can't wedge future runs.
 Only step 01 is retried automatically (3 attempts, 30s apart) — steps
 02–06 operate on local files, so a repeat failure is almost always a
-real problem a retry won't fix.
+real problem a retry won't fix. (04's "nothing to import" exit code is
+likewise never retried — it's a normal outcome, not a transient error.)
 
 ## Setup
 

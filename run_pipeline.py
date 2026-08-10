@@ -26,17 +26,25 @@ WHAT IT DOES, IN ORDER
      order, STOPPING IMMEDIATELY if any of them fail (see EXIT CODES) -
      each step's output depends entirely on the previous step's output
      file, so there is no reasonable way to "skip and continue".
+     EXCEPTION: if 04_validate.py finds that every row in this batch
+     already has a non-blank 'Keep?' (nothing new to import), 05 is
+     skipped (there is nothing to export) but 06_notify.py is still
+     run directly - see step 6 - so a "nothing to import" completion
+     email still goes out. Users depend on that email arriving; they
+     shouldn't have to check server logs to learn the batch ran with
+     nothing new.
   6. If 01-05 all succeed, runs 06_notify.py to send the completion
-     email. A failure here is logged and reported distinctly (see EXIT
-     CODES) but does NOT roll back or repeat steps 1-5, since A6 has
-     already been produced and is importable into TMS regardless of
-     whether the email went out.
+     email (this also happens, out of the normal 01->06 order, right
+     after 04 in the "nothing to import" case described in step 5). A
+     failure here is logged and reported distinctly (see EXIT CODES)
+     but does NOT roll back or repeat steps 1-5, since A6 (or, in the
+     nothing-to-import case, A5B) has already been produced.
   7. Releases the lock and prints a final summary (what ran, exit
      codes, durations) before exiting with the appropriate code.
 
 EXIT CODES (this is the contract a cron wrapper / monitoring tool
 should check)
-  0  - Normal, nothing to alert on. Covers THREE distinct situations,
+  0  - Normal, nothing to alert on. Covers FOUR distinct situations,
        all logged clearly so you can tell them apart by reading the
        log, but none of which need a human to act:
          a) full pipeline ran successfully end-to-end, including the
@@ -45,7 +53,17 @@ should check)
             process yet (this week's extract hasn't landed on the
             SFTP server) - normal/expected if cron runs more often
             than the weekly extract actually arrives
-         c) another instance of this pipeline was already running
+         c) 04_validate.py determined that every row in this batch
+            already has a non-blank 'Keep?' (e.g. all "NOT DEPLOYED" /
+            "NOT ASSET") - there is nothing new to import into TMS
+            this run. A5B is still produced for the audit trail,
+            05_export.py is skipped since there is no A5/A6 to
+            export, but 06_notify.py IS still run (out of the normal
+            step order) to send a distinct "nothing to import"
+            completion email - see step 5/6 above. If that email
+            itself fails to send, this is reported as exit code 2,
+            same as any other 06_notify.py failure.
+         d) another instance of this pipeline was already running
             (lock held) - this run exited immediately without doing
             anything, to avoid double-processing the same batch
   1  - A REAL FAILURE in steps 01-05 (data download/processing). The
@@ -80,6 +98,8 @@ RETRY POLICY
   and a repeat failure almost always means a real, non-transient
   problem (bad data, missing template, disk full, etc.) that a retry
   won't fix; see the log / re-run the specific step by hand once fixed.
+  (04_validate.py's exit code 3, "nothing to import", is likewise
+  never retried - it's a normal outcome, not a transient error.)
 
 TIMEOUTS
   Every step gets a generous but finite timeout (STEP_TIMEOUT_SECONDS,
@@ -119,9 +139,14 @@ EXIT_PIPELINE_FAILED = 1
 EXIT_NOTIFY_FAILED = 2
 
 # Exit codes a numbered script can return that this master script
-# specifically understands (see 01_download_sftp.py's own contract).
+# specifically understands (see the relevant script's own contract).
 STEP_EXIT_OK = 0
-STEP_EXIT_NOT_READY = 2  # only meaningful for 01_download_sftp.py
+STEP_EXIT_NOT_READY = 2       # only meaningful for 01_download_sftp.py
+STEP_EXIT_NOTHING_TO_IMPORT = 3  # only meaningful for 04_validate.py
+
+# Step exit codes that mean "stop the pipeline here, but this is a
+# normal/expected outcome, not a failure" - see EXIT CODES above.
+STEP_EXIT_STOP_CODES = (STEP_EXIT_NOT_READY, STEP_EXIT_NOTHING_TO_IMPORT)
 
 STEPS = [
     {"id": "01", "script": "01_download_sftp.py", "max_attempts": 3, "retry_delay_s": 30},
@@ -280,13 +305,16 @@ def run_step(step):
                 logger.info(f"--- {script} stdout ---\n{stdout.rstrip()}")
             return returncode, duration_recorded
 
-        if returncode == STEP_EXIT_NOT_READY:
-            # Only meaningful for 01_download_sftp.py - a normal,
-            # expected "nothing new yet" outcome, never retried.
-            logger.info(
-                f"Step {step['id']} ({script}) reports NOT READY (exit code 2) - "
-                f"nothing new to process this run."
-            )
+        if returncode in STEP_EXIT_STOP_CODES:
+            # A normal, expected "nothing to do" outcome - never
+            # retried. Meaningful for 01_download_sftp.py (code 2,
+            # "not ready yet") and 04_validate.py (code 3, "nothing to
+            # import this run").
+            if returncode == STEP_EXIT_NOT_READY:
+                reason = "NOT READY (nothing new to process this run)"
+            else:
+                reason = "NOTHING TO IMPORT (no rows required import this run)"
+            logger.info(f"Step {step['id']} ({script}) reports {reason} - exit code {returncode}.")
             if stdout.strip():
                 logger.info(f"--- {script} stdout ---\n{stdout.rstrip()}")
             return returncode, duration_recorded
@@ -365,10 +393,51 @@ def main():
             if returncode == STEP_EXIT_NOT_READY:
                 # Only 01_download_sftp.py should ever produce this.
                 # Stop the pipeline here - there is nothing for 02-06
-                # to process yet - and treat the whole run as a normal,
-                # silent no-op (exit code 0).
+                # to process yet - and treat the whole run as a
+                # normal, silent no-op (exit code 0).
                 logger.info("Stopping pipeline: nothing new to process this run.")
                 exit_code = EXIT_OK
+                break
+
+            if returncode == STEP_EXIT_NOTHING_TO_IMPORT:
+                # Only 04_validate.py should ever produce this: every
+                # row in the batch already had a non-blank 'Keep?', so
+                # there is nothing to export. 05_export.py is skipped,
+                # but users depend on getting a completion email either
+                # way - not on checking server logs - so 06_notify.py
+                # is still run directly here (out of the normal step
+                # order) whenever it's part of the planned run. If this
+                # was invoked with "--only 04" (debugging a single
+                # step), that plan doesn't include 06, so it's left
+                # alone rather than run behind the user's back.
+                if any(s["id"] == "06" for s in steps_to_run):
+                    logger.info(
+                        "04_validate.py found no rows to import this run (every "
+                        "row already had a non-blank 'Keep?'). A5B was still "
+                        "produced for the audit trail. Skipping 05_export.py "
+                        "(nothing to export), but running 06_notify.py now so a "
+                        "'nothing to import' completion email still goes out."
+                    )
+                    notify_step = next(s for s in STEPS if s["id"] == "06")
+                    notify_returncode, _ = run_step(notify_step)
+                    if notify_returncode == STEP_EXIT_OK:
+                        exit_code = EXIT_OK
+                    else:
+                        logger.error(
+                            "06_notify.py failed after a 'nothing to import' batch - "
+                            "the notification email was NOT sent. Check the log "
+                            "above, fix [notifications] in config.conf if needed, "
+                            "and re-run 'python 06_notify.py' by hand once resolved."
+                        )
+                        exit_code = EXIT_NOTIFY_FAILED
+                else:
+                    logger.info(
+                        "04_validate.py found no rows to import this run (every "
+                        "row already had a non-blank 'Keep?'). A5B was still "
+                        "produced for the audit trail. Stopping here since this "
+                        "run's plan (--only 04) doesn't include 06_notify.py."
+                    )
+                    exit_code = EXIT_OK
                 break
 
             # Any other non-zero code is a real failure.

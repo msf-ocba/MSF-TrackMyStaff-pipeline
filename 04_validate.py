@@ -22,7 +22,7 @@ corresponding TMS article codes before performing validation.
 
 OUTPUT
 
-The script creates two workbooks:
+The script creates up to three files:
 
   - A5_EXTRACTION_TMS_OCBA_YYMMDD.xlsx
       Contains all rows where 'Keep?' is blank, together with the
@@ -30,11 +30,38 @@ The script creates two workbooks:
       validation status:
           - Green: Checked
           - Red: Review
+      NOT created if there are zero rows with blank 'Keep?' - see
+      EXIT CODES below.
 
   - A5B_EXTRACTION_TMS_OCBA_YYMMDD.xlsx
       Contains all rows excluded from A5 (those where 'Keep?' is not
       blank). The workbook retains the same row colouring applied in
-      A4 to indicate why each record was excluded.
+      A4 to indicate why each record was excluded. Always created
+      when there is at least one excluded row, even if A5 is not
+      created.
+
+  - A5_META_EXTRACTION_TMS_OCBA_YYMMDD.json
+      Only written when there are zero rows with blank 'Keep?' (see
+      exit code 3 below). This is a lighter counterpart to
+      05_export.py's A6_META_....json: since no A6 exists for this
+      batch, 06_notify.py reads this file instead so it can still
+      send a completion email explaining nothing was imported this
+      run - technicians rely on that email arriving, not on checking
+      server logs.
+
+EXIT CODES
+  0  - Normal. A5 was produced (there was at least one row with
+       blank 'Keep?' to validate/import).
+  3  - Normal, NOT an error. Every row in this batch's A4 workbook
+       had a non-blank 'Keep?' (e.g. all "NOT DEPLOYED" / "NOT
+       ASSET"), so there is nothing new to import into TMS this run.
+       A5B and A5_META_....json are still written (for the audit
+       trail and for 06_notify.py, respectively), but A5 is not
+       created and no article validation is performed. A caller (see
+       run_pipeline.py) should skip 05_export.py (nothing to export)
+       but still run 06_notify.py, so a "nothing to import" email
+       still goes out.
+  1 (implicit, via uncaught exception) - a real failure.
 
 Usage:
     python 04_validate.py [path_to_A4_workbook.xlsx]
@@ -45,6 +72,7 @@ most recent A4 file.
 import os
 import sys
 import glob
+import json
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -66,6 +94,10 @@ REVIEW = "Review"
 
 NOT_ASSET = "NOT ASSET"
 NOT_DEPLOYED = "NOT DEPLOYED"
+
+# Exit codes - see module docstring's EXIT CODES section.
+EXIT_OK = 0
+EXIT_NOTHING_TO_IMPORT = 3
 
 
 def find_latest_a4(work_dir):
@@ -170,6 +202,11 @@ def apply_article_compose(blank_df, compose_map):
 
 
 def add_article_check_conditional_formatting(ws, n_rows, n_cols, check_col_idx):
+    if n_rows <= 1:
+        # No data rows (header only) - there is nothing to format, and
+        # an "A2:...1" range is invalid and raises inside openpyxl.
+        return
+
     check_col_letter = get_column_letter(check_col_idx)
     last_col_letter = get_column_letter(n_cols)
     data_range = f"A2:{last_col_letter}{n_rows}"
@@ -202,6 +239,10 @@ def add_keep_conditional_formatting(ws, n_rows, n_cols, keep_col_idx):
     the sheet's white background. Kept in sync manually with
     03_clean_transform.py.
     """
+    if n_rows <= 1:
+        # No data rows (header only) - nothing to format.
+        return
+
     keep_col_letter = get_column_letter(keep_col_idx)
     last_col_letter = get_column_letter(n_cols)
     data_range = f"A2:{last_col_letter}{n_rows}"
@@ -313,6 +354,33 @@ def resolve_output_dir(paths):
     return output_dir, week_tag
 
 
+def write_nothing_to_import_meta(output_dir, date_tag, week_tag, total_rows, a5b_path, a4_path):
+    """
+    Written only when there are zero rows with blank 'Keep?' (nothing
+    to import this run - see EXIT CODES above). This is a lighter
+    counterpart to 05_export.py's A6_META_EXTRACTION_TMS_OCBA_*.json:
+    there is no A6 to describe, so this instead gives 06_notify.py
+    just enough (an "outcome" marker plus the batch numbers and the
+    A4/A5B paths) to send a distinct "nothing to import" completion
+    email - still attaching A4/A5B - instead of the usual A6-summary
+    email. Users depend on getting that email either way, not on
+    checking server logs to find out the batch ran.
+    """
+    meta = {
+        "outcome": "nothing_to_import",
+        "week_tag": week_tag,
+        "date_tag": date_tag,
+        "output_dir": output_dir,
+        "total_rows": total_rows,
+        "a5b_path": a5b_path,
+        "a4_path": a4_path,
+    }
+    meta_path = os.path.join(output_dir, f"A5_META_EXTRACTION_TMS_OCBA_{date_tag}.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    return meta_path
+
+
 def main():
     cfg = load_config()
     paths = get_paths(cfg)
@@ -356,6 +424,32 @@ def main():
     excluded_df = df[~keep_blank_mask].copy()
     print(f"A4 rows: {len(df)} total | {len(blank_df)} with blank Keep? carried forward to A5 | "
           f"{len(excluded_df)} excluded (non-blank Keep?) carried to A5B")
+
+    # --- Nothing to import this run? ---
+    # Every row already has a non-blank 'Keep?' (e.g. "NOT DEPLOYED" /
+    # "NOT ASSET"), so there is nothing new for TMS. Stop here rather
+    # than continuing on to the article-compose/TMS lookups (nothing to
+    # validate) and attempting to build an empty A5 workbook (which
+    # openpyxl's conditional formatting can't represent - an "A2:...1"
+    # range with 0 data rows is invalid and raises).
+    if len(blank_df) == 0:
+        print("\nNo rows with a blank 'Keep?' in this A4 workbook - there is nothing "
+              "new to validate or import into TMS this run.")
+
+        output_dir, week_tag = resolve_output_dir(paths)
+        a5b_path = save_a5b_xlsx(excluded_df, output_dir, date_tag)
+        print(f"A5B workbook (excluded rows, for the audit trail) saved to: {a5b_path} "
+              f" (output folder: {week_tag})")
+
+        meta_path = write_nothing_to_import_meta(
+            output_dir, date_tag, week_tag, len(df), a5b_path, a4_path
+        )
+        print(f"Meta file for 06_notify.py saved to: {meta_path}")
+
+        print("\nNo A5 workbook was produced - there is nothing to import into TMS "
+              "this run. 05_export.py will not run, but run_pipeline.py will still "
+              "run 06_notify.py so a 'nothing to import' completion email goes out.")
+        sys.exit(EXIT_NOTHING_TO_IMPORT)
 
     # --- Article compose substitution (hidden Kits without leading 'K') ---
     compose_map = load_article_compose_map(article_compose_path)
