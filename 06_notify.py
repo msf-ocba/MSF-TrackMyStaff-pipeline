@@ -55,6 +55,12 @@ EMAIL SUMMARY
 
 A single completion email is sent for every batch. The email includes:
 
+  - Extraction summary: total rows extracted from MSF Logistique
+    (i.e. every row in A4) and how each one was worked on - imported
+    via A6, Kit at a deployed mission (review required), Kit not
+    deployed, or not deployed. See summarise_extraction().
+  - A "review needed" subject/headline whenever anything needs a
+    person to look at it - including any Kit article to be assessed.
   - Overall batch statistics.
   - Any Article Code Review, missing Location, or duplicate Article
     Code warnings recorded during export.
@@ -80,6 +86,7 @@ import os
 import sys
 import glob
 import json
+import re
 import smtplib
 import pandas as pd
 from email.mime.text import MIMEText
@@ -237,147 +244,311 @@ def find_kit_only_rows(a5b_path):
     return lines
 
 
+def summarise_extraction(a4_path):
+    """
+    Counts every row MSF Logistique sent us (= every row in A4) by how
+    it was worked on, using A4's 'Keep?' column:
+
+      blank                    -> passed all checks; validated (04) and
+                                  exported to A6 (05) for TMS import
+      "NOT ASSET"              -> Kit at a deployed mission; excluded
+                                  from A6, REVIEW REQUIRED (must be
+                                  broken down into component assets)
+      "NOT ASSET; NOT DEPLOYED"-> Kit that never reached a valid
+                                  mission; excluded, nothing to do
+      "NOT DEPLOYED"           -> non-Kit, not a deployed mission;
+                                  excluded, nothing to do
+
+    Matching is by substring (same idea as the row colouring in
+    03/04), so the wording of the combined value can change without
+    breaking the counts. Anything non-blank that matches neither reason
+    lands in 'other' so the numbers always add up to 'total'.
+
+    Returns a dict, or None if A4 is missing/unreadable (the email
+    still goes out, just without the summary).
+    """
+    if not a4_path or not os.path.exists(a4_path):
+        return None
+    try:
+        df = pd.read_excel(a4_path, dtype=str, keep_default_na=True)
+    except Exception as e:
+        print(f"  WARNING: could not read '{a4_path}' for the extraction summary ({e}). "
+              f"Sending the email without it.")
+        return None
+    if "Keep?" not in df.columns:
+        print(f"  WARNING: '{a4_path}' has no 'Keep?' column - can't build the "
+              f"extraction summary. Sending the email without it.")
+        return None
+
+    keep = df["Keep?"].fillna("").astype(str).str.strip().str.upper()
+    is_kit = keep.str.contains(NOT_ASSET, regex=False)
+    not_dep = keep.str.contains(NOT_DEPLOYED, regex=False)
+    blank = keep == ""
+
+    return {
+        "total": int(len(df)),
+        "imported": int(blank.sum()),
+        "kit_deployed": int((is_kit & ~not_dep).sum()),
+        "kit_not_deployed": int((is_kit & not_dep).sum()),
+        "not_deployed": int((~is_kit & not_dep).sum()),
+        "other": int((~blank & ~is_kit & ~not_dep).sum()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Email layout helpers
+#
+# The completion email is laid out in this order so the reader gets the
+# actionable part first and every number appears once:
+#
+#   1. Headline + one-line "needs attention" status
+#   2. WHAT NEEDS YOUR ATTENTION - numbered, grouped (not row by row)
+#   3. BATCH BREAKDOWN           - what happened to every extracted row
+#   4. FILES                     - output folder + notes on missing files
+#      (send_email() then appends the "Attachments:" list)
+# ---------------------------------------------------------------------------
+
+MAX_ITEMS_SHOWN = 5   # serials / project codes listed inline before "+N more"
+
+_REVIEW_RE = re.compile(r"Article Code '([^']*)' \(Serial '([^']*)'\)")
+_MISSING_LOC_RE = re.compile(r"Article Code '([^']*)' \(Project Code '([^']*)'\).*?prefix '([^']*)'")
+_DUPLICATE_RE = re.compile(r"Article Code '([^']*)' \(Serial '([^']*)'\)")
+
+
+def _group(lines, regex, key_group=1, value_group=2):
+    """
+    Groups the per-row summary strings written by 05_export.py by one of
+    their captured fields, keeping first-seen order.
+
+    Returns (groups, unparsed): groups is {key: [values...]}; unparsed is
+    any line that didn't match (e.g. if 05's wording changes) so nothing
+    is ever silently dropped from the email.
+    """
+    groups, unparsed = {}, []
+    for line in lines:
+        m = regex.search(line)
+        if not m:
+            unparsed.append(line)
+            continue
+        groups.setdefault(m.group(key_group), []).append(m.group(value_group))
+    return groups, unparsed
+
+
+def _inline(items, label):
+    """' - label: a, b, c (+N more)' for short lists, '' when there's nothing to show."""
+    items = [str(i) for i in items if str(i).strip()]
+    if not items:
+        return ""
+    shown = ", ".join(items[:MAX_ITEMS_SHOWN])
+    more = len(items) - MAX_ITEMS_SHOWN
+    return f" - {label}: {shown}" + (f" (+{more} more)" if more > 0 else "")
+
+
+def _unparsed_lines(unparsed):
+    out = [f"   - {line}" for line in unparsed[:MAX_ITEMS_SHOWN]]
+    if len(unparsed) > MAX_ITEMS_SHOWN:
+        out.append(f"   - ... and {len(unparsed) - MAX_ITEMS_SHOWN} more (see A6)")
+    return out
+
+
+def build_attention_blocks(n_review, review_rows_summary, n_missing_location,
+                           missing_location_summary, n_duplicate, duplicate_summary,
+                           kit_only_summary):
+    """
+    Returns a list of (heading, detail_lines) for everything a person
+    needs to look at, most important first. Empty list = nothing to do.
+    Repeated rows are grouped (by Article Code / location prefix) so a
+    batch with 45 identical-code rows reads as one line, not 45.
+    """
+    blocks = []
+
+    if kit_only_summary:
+        blocks.append((
+            f"Kit articles to assess ({len(kit_only_summary)}) - excluded from A6",
+            ["   These Kits reached a valid TMS mission. Break each one into its component",
+             "   assets and import those into TMS separately."]
+            + [f"   - {line}" for line in kit_only_summary],
+        ))
+
+    if n_review:
+        groups, unparsed = _group(review_rows_summary, _REVIEW_RE)
+        detail = ["   Included in A6 and highlighted - look each Article Code up in TMS."]
+        for code, serials in groups.items():
+            n = len(serials)
+            detail.append(f"   - {code}: {n} row(s)" + (_inline(serials, "serials") if n <= MAX_ITEMS_SHOWN else ""))
+        detail += _unparsed_lines(unparsed)
+        blocks.append((
+            f"Article Code not found in TMS - manual lookup ({n_review} row(s), {len(groups) or len(unparsed)} code(s))",
+            detail,
+        ))
+
+    if n_missing_location:
+        groups, unparsed = _group(missing_location_summary, _MISSING_LOC_RE, key_group=3, value_group=2)
+        detail = ["   Location left blank in A6 - fill in by hand, or add the prefix to templates/location.xlsx."]
+        for prefix, projects in groups.items():
+            uniq = list(dict.fromkeys(projects))
+            detail.append(f"   - Prefix '{prefix}': {len(projects)} row(s)" + _inline(uniq, "project codes"))
+        detail += _unparsed_lines(unparsed)
+        blocks.append((f"Missing Location match ({n_missing_location} row(s))", detail))
+
+    if n_duplicate:
+        groups, unparsed = _group(duplicate_summary, _DUPLICATE_RE)
+        detail = ["   Same Article Code AND Serial appear more than once - TMS will block these",
+                  "   on import. Check they aren't duplicate entries of the same item."]
+        for code, serials in groups.items():
+            detail.append(f"   - {code}: {len(serials)} row(s)" + _inline(list(dict.fromkeys(serials)), "serials"))
+        detail += _unparsed_lines(unparsed)
+        blocks.append((f"Duplicate Article Code + Serial ({n_duplicate} row(s))", detail))
+
+    return blocks
+
+
+def _status_line(kit_only_summary, n_review, n_missing_location, n_duplicate):
+    parts = []
+    if kit_only_summary:
+        parts.append(f"{len(kit_only_summary)} Kit(s) to assess")
+    if n_review:
+        parts.append(f"{n_review} row(s) with an Article Code to look up")
+    if n_missing_location:
+        parts.append(f"{n_missing_location} row(s) missing a Location")
+    if n_duplicate:
+        parts.append(f"{n_duplicate} duplicate row(s)")
+    if not parts:
+        return "No review needed."
+    return "REVIEW REQUIRED: " + "; ".join(parts) + "."
+
+
+def build_breakdown_lines(summary, n_in_a6=None, n_clean=None):
+    """
+    "BATCH BREAKDOWN" block: total rows extracted from MSF Logistique
+    (every row in A4) and how each was worked on. Every number appears
+    here once; the rest of the email refers back to it rather than
+    repeating it. n_in_a6 is only a cross-check against A4's blank-'Keep?'
+    row count.
+    """
+    if not summary:
+        return ["BATCH BREAKDOWN", "   Not available (A4 could not be read for this batch).", ""]
+
+    imported = summary["imported"]
+    imported_note = ""
+    if n_clean is not None:
+        imported_note = f" ({n_clean} clean, {imported - n_clean} flagged for review)"
+
+    lines = [
+        "BATCH BREAKDOWN",
+        f"Rows extracted from MSF Logistique: {summary['total']}",
+        f"   - Imported via A6: {imported}{imported_note}",
+        f"   - Kit at a deployed mission - to assess, excluded from A6: {summary['kit_deployed']}",
+        f"   - Kit not deployed - excluded, no action: {summary['kit_not_deployed']}",
+        f"   - Not deployed (non-Kit) - excluded, no action: {summary['not_deployed']}",
+    ]
+    if summary["other"]:
+        lines.append(f"   - Excluded for another reason: {summary['other']}")
+    lines.append(f"   Excluded in total (listed in A5B): {summary['total'] - imported}")
+
+    if n_in_a6 is not None and n_in_a6 != imported:
+        lines.append(
+            f"   NOTE: A6 has {n_in_a6} row(s) but A4 has {imported} row(s) with a blank "
+            f"'Keep?' - these should match, please check this batch."
+        )
+    lines.append("")
+    return lines
+
+
+def _files_lines(a6_path, a4_path, a5b_path):
+    """One 'output folder' line plus a note for anything expected but missing."""
+    lines = ["FILES"]
+    folder_src = a6_path or a4_path or a5b_path
+    if folder_src:
+        lines.append(f"Output folder: {os.path.dirname(folder_src)}")
+    if not a4_path:
+        lines.append("Note: A4 (full pre-filter extract) was not found for this batch.")
+    if not a5b_path:
+        lines.append("Note: A5B (excluded rows) was not found for this batch.")
+    return lines
+
+
 def build_completion_email(week_tag, date_tag, total_rows, n_clean, n_review, n_missing_location,
-                            n_duplicate, review_rows_summary, missing_location_summary,
-                            duplicate_summary, a6_path, a5b_path, a4_path, kit_only_summary):
+                           n_duplicate, review_rows_summary, missing_location_summary,
+                           duplicate_summary, a6_path, a5b_path, a4_path, kit_only_summary,
+                           extraction_summary=None):
     """
-    Builds ONE email that always reports the batch's outcome:
-      - If everything is clean: a short success summary.
-      - If anything needs review: the same summary, plus the detailed
-        list of which rows and why (review / missing location /
-        duplicate Article Code), so the technician doesn't have to
-        open the console output or A6 itself to find them.
-    A4's and A5B's paths (or their absence) are always reported,
-    regardless of whether A6 itself needs review, since they reflect
-    earlier, separate stages of the batch (the full pre-filter extract,
-    and 04_validate.py's Keep? exclusions).
+    The normal (A6) completion email - see the layout note above.
 
-    kit_only_summary (see find_kit_only_rows()) is always listed, in
-    its own section, whenever it's non-empty - independent of
-    needs_review - since these are Kits that reached a deployed
-    mission and still need a person to explode them into assets and
-    import those into TMS; that's actionable regardless of whether
-    anything else in the batch needs attention.
+    Anything a person has to act on (a Kit to assess, Article Code
+    'Review' rows, missing Location, duplicates) makes the subject read
+    "review needed" and is listed first, grouped, under WHAT NEEDS YOUR
+    ATTENTION. A Kit that reached a deployed mission counts on its own:
+    it always needs assessing, independent of anything else in A6.
 
-    (The actual Attachments section is appended later, in send_email,
-    once it's known what was actually attached.)
-
-    The subject leads with week_tag (e.g. "Y26W26") to match the
-    output folder naming used throughout the pipeline; the headline
-    and body still name the batch's own date_tag (e.g. "260629") for
-    precise identification, since more than one batch can land in the
-    same week folder.
-
-    NOTE: this is the "normal" (A6) email. For a batch with zero rows
-    to import, see build_nothing_to_import_email() instead.
+    For a batch with zero rows to import, see
+    build_nothing_to_import_email() instead.
     """
-    needs_review = bool(n_review or n_missing_location or n_duplicate)
+    kit_only_summary = kit_only_summary or []
+    needs_review = bool(n_review or n_missing_location or n_duplicate or kit_only_summary)
 
     if needs_review:
         subject = f"[MSF TMS Import] {week_tag} - Batch {date_tag} completed - review needed"
-        headline = f"Batch {date_tag} (folder {week_tag}) completed: {total_rows} item(s) processed into A6."
     else:
         subject = f"[MSF TMS Import] {week_tag} - Batch {date_tag} completed successfully"
-        headline = (
-            f"Batch {date_tag} (folder {week_tag}) completed successfully: {total_rows} item(s) processed "
-            f"into A6, all clean. No review needed."
-        )
 
-    body_lines = [
-        headline,
-        "",
-        f"Total items in A6: {total_rows}",
-        f"Clean (no issues): {n_clean}",
-        f"Article Code Check = Review: {n_review}",
-        f"Missing Location match: {n_missing_location}",
-        f"Duplicate Article Code: {n_duplicate}",
-        "",
-        f"A6 output file: {a6_path}",
-    ]
-
-    if a4_path:
-        body_lines.append(f"A4 (full pre-filter extract) file: {a4_path}")
+    if extraction_summary:
+        headline = (f"Batch {date_tag} (folder {week_tag}): {extraction_summary['total']} rows extracted "
+                    f"from MSF Logistique, {total_rows} imported via A6.")
     else:
-        body_lines.append("A4 (full pre-filter extract): not found for this batch")
+        headline = f"Batch {date_tag} (folder {week_tag}): {total_rows} item(s) processed into A6."
 
-    if a5b_path:
-        body_lines.append(f"A5B (excluded rows from 04_validate.py) file: {a5b_path}")
-    else:
-        body_lines.append("A5B (excluded rows from 04_validate.py): not found for this batch")
+    body_lines = [headline,
+                  _status_line(kit_only_summary, n_review, n_missing_location, n_duplicate),
+                  ""]
 
-    if needs_review:
-        body_lines.append("")
-        if review_rows_summary:
-            body_lines.append("Article Code Check = Review - details:")
-            body_lines.extend(f"  - {line}" for line in review_rows_summary)
+    blocks = build_attention_blocks(n_review, review_rows_summary, n_missing_location,
+                                    missing_location_summary, n_duplicate, duplicate_summary,
+                                    kit_only_summary)
+    if blocks:
+        body_lines.append("WHAT NEEDS YOUR ATTENTION")
+        for i, (heading, detail) in enumerate(blocks, start=1):
+            body_lines.append(f"{i}. {heading}")
+            body_lines.extend(detail)
             body_lines.append("")
-        if missing_location_summary:
-            body_lines.append("Missing Location match - details:")
-            body_lines.extend(f"  - {line}" for line in missing_location_summary)
-            body_lines.append("")
-        if duplicate_summary:
-            body_lines.append("Duplicate Article Code - details:")
-            body_lines.extend(f"  - {line}" for line in duplicate_summary)
 
-    if kit_only_summary:
-        body_lines.append("")
-        body_lines.append(
-            f"Kit articles excluded from A6, sent to a deployed mission ({len(kit_only_summary)}):"
-        )
-        body_lines.append(
-            "  These are Kits (not individually flagged as undeployed) that reached a "
-            "valid TMS mission - explode each one into its component assets and import "
-            "those into TMS separately; the Kit line itself was excluded from A6 and is "
-            "never imported as a single asset."
-        )
-        body_lines.extend(f"  - {line}" for line in kit_only_summary)
-
+    body_lines.extend(build_breakdown_lines(extraction_summary, n_in_a6=total_rows, n_clean=n_clean))
+    body_lines.extend(_files_lines(a6_path, a4_path, a5b_path))
     return subject, body_lines
 
 
-def build_nothing_to_import_email(week_tag, date_tag, total_rows, a5b_path, a4_path):
+def build_nothing_to_import_email(week_tag, date_tag, total_rows, a5b_path, a4_path,
+                                  kit_only_summary=None, extraction_summary=None):
     """
     Completion email for a batch where 04_validate.py found zero rows
-    with a blank 'Keep?' - there was nothing new to import into TMS
-    this run (every row was already "NOT ASSET" / "NOT DEPLOYED" /
-    both). No A6 exists for this batch, so this is a distinct, shorter
-    email from build_completion_email() above: it confirms the batch
-    ran, explains why nothing was imported, and still attaches
-    A4/A5B so every source row is accounted for without anyone having
-    to check server logs.
+    with a blank 'Keep?' - nothing new for TMS this run, so no A6
+    exists. Same layout as build_completion_email(); still flags any
+    Kit at a deployed mission, since that needs a person even when
+    there is nothing to import.
     """
-    subject = f"[MSF TMS Import] {week_tag} - Batch {date_tag} - nothing to import"
-    headline = (
-        f"Batch {date_tag} (folder {week_tag}) ran successfully, but had nothing new "
-        f"to import into TMS: all {total_rows} row(s) in this batch already had a "
-        f"non-blank 'Keep?' (e.g. 'NOT ASSET' and/or 'NOT DEPLOYED')."
-    )
-
-    body_lines = [
-        headline,
-        "",
-        f"Total items in this batch: {total_rows}",
-        "Items imported into TMS (A6): 0 - no A6 file was produced this run.",
-        "",
-    ]
-
-    if a4_path:
-        body_lines.append(f"A4 (full pre-filter extract) file: {a4_path}")
+    kit_only_summary = kit_only_summary or []
+    if kit_only_summary:
+        subject = f"[MSF TMS Import] {week_tag} - Batch {date_tag} - nothing to import - review needed"
     else:
-        body_lines.append("A4 (full pre-filter extract): not found for this batch")
+        subject = f"[MSF TMS Import] {week_tag} - Batch {date_tag} - nothing to import"
 
-    if a5b_path:
-        body_lines.append(f"A5B (excluded rows from 04_validate.py) file: {a5b_path}")
-    else:
-        body_lines.append("A5B (excluded rows from 04_validate.py): not found for this batch")
+    headline = (f"Batch {date_tag} (folder {week_tag}): {total_rows} rows extracted from MSF Logistique, "
+                f"none to import into TMS - every row already had a non-blank 'Keep?'. "
+                f"No A6 file was produced.")
+    status = (_status_line(kit_only_summary, 0, 0, 0) if kit_only_summary
+              else "No action needed unless this is unexpected - check A4/A5B for what came in.")
 
-    body_lines.append("")
-    body_lines.append(
-        "No action is needed unless this is unexpected - if you were expecting new "
-        "items this week, check A4/A5B (attached) for what came in and why every row "
-        "was excluded."
-    )
+    body_lines = [headline, status, ""]
+    blocks = build_attention_blocks(0, [], 0, [], 0, [], kit_only_summary)
+    if blocks:
+        body_lines.append("WHAT NEEDS YOUR ATTENTION")
+        for i, (heading, detail) in enumerate(blocks, start=1):
+            body_lines.append(f"{i}. {heading}")
+            body_lines.extend(detail)
+            body_lines.append("")
 
+    body_lines.extend(build_breakdown_lines(extraction_summary))
+    body_lines.extend(_files_lines(None, a4_path, a5b_path))
     return subject, body_lines
 
 
@@ -524,8 +695,12 @@ def _handle_nothing_to_import(cfg, meta, meta_path):
         print(f"  WARNING: A5B file recorded in meta ('{a5b_path}') no longer exists. Continuing without it.")
         a5b_path = None
 
+    kit_only_summary = find_kit_only_rows(a5b_path)
+    extraction_summary = summarise_extraction(a4_path)
+
     subject, body_lines = build_nothing_to_import_email(
-        meta["week_tag"], meta["date_tag"], meta["total_rows"], a5b_path, a4_path
+        meta["week_tag"], meta["date_tag"], meta["total_rows"], a5b_path, a4_path,
+        kit_only_summary=kit_only_summary, extraction_summary=extraction_summary,
     )
     attachment_paths = ([a4_path] if a4_path else []) + ([a5b_path] if a5b_path else [])
     send_email(cfg, subject, body_lines, attachment_paths=attachment_paths)
@@ -566,12 +741,14 @@ def main():
         print(f"  Found {len(kit_only_summary)} Kit-only (NOT ASSET only) row(s) in A5B - "
               f"listing them in their own section of the completion email.")
 
+    extraction_summary = summarise_extraction(a4_path)
+
     subject, body_lines = build_completion_email(
         meta["week_tag"], meta["date_tag"], meta["total_rows"], meta["n_clean"],
         meta["n_review"], meta["n_missing_location"], meta["n_duplicate"],
         meta["review_rows_summary"], meta["missing_location_summary"],
         meta["duplicate_summary"], meta["a6_path"], a5b_path, a4_path,
-        kit_only_summary,
+        kit_only_summary, extraction_summary,
     )
     attachment_paths = (
         [meta["a6_path"]]
