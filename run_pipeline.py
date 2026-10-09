@@ -3,9 +3,9 @@
 run_pipeline.py
 ----------------
 Master script for the MSF Logistique -> TMS asset-import pipeline.
-Runs 01_download_sftp.py through 06_notify.py, in order, as a single
+Runs 00_export_odoo.py through 06_notify.py, in order, as a single
 automated job - this is the script a cron job (or systemd timer)
-should actually call. Running the six numbered scripts by hand is
+should actually call. Running the seven numbered scripts by hand is
 still supported for debugging (see each script's own docstring), but
 in production this file is the entry point.
 
@@ -19,9 +19,23 @@ WHAT IT DOES, IN ORDER
   3. Sets up logging to both the console (for `cron`'s own output
      capture / MAILTO) and a timestamped file under ./logs/, so every
      run leaves a permanent record.
-  4. Runs 01_download_sftp.py. This step gets a few retries with a
+  4. Runs 00_export_odoo.py, which refreshes the reference files under
+     templates/ (TMS article list + location list) from Odoo, so this
+     batch is validated against current data. If this step still fails
+     after its retries, the pipeline does NOT stop: it logs a warning,
+     emails the [notifications] recipients the error (and how old the
+     existing templates are), and carries on with step 01 using the
+     existing (stale) templates. The overall exit code is not affected
+     by a step 00 failure - the email is the alert. (With --only 00 a
+     failure returns exit code 1 and sends no email.)
+  4b. Runs 01_download_sftp.py. This step gets a few retries with a
      short backoff, since SFTP/network hiccups are the single most
      common transient failure in this pipeline (see RETRY POLICY).
+     If step 01 does not produce a file - exit code 1 (real error, after
+     its retries) OR exit code 2 (this week's extract not on the SFTP
+     server yet) - an alert email is sent to the [notifications]
+     recipients (short, non-technical message) before the pipeline stops.
+     No email is sent when running with --only.
   5. If 01 downloaded a new file, runs 02 -> 03 -> 04 -> 05 in strict
      order, STOPPING IMMEDIATELY if any of them fail (see EXIT CODES) -
      each step's output depends entirely on the previous step's output
@@ -66,7 +80,8 @@ should check)
          d) another instance of this pipeline was already running
             (lock held) - this run exited immediately without doing
             anything, to avoid double-processing the same batch
-  1  - A REAL FAILURE in steps 01-05 (data download/processing). The
+  1  - A REAL FAILURE in steps 01-05 (data download and
+       processing). The
        batch was NOT fully processed - A6 may not exist, or may be
        incomplete/stale. Needs investigation before the next run.
   2  - Steps 01-05 all succeeded (A6 was produced correctly, and IS
@@ -89,8 +104,9 @@ LOCKING
   rather than waiting or erroring.
 
 RETRY POLICY
-  Only 01_download_sftp.py is retried automatically, and only when it
-  fails with a real error (exit code 1 / a crash / a timeout) - NOT
+  Only 00_export_odoo.py and 01_download_sftp.py are retried
+  automatically (both talk to a remote server), and only when they
+  fail with a real error (exit code 1 / a crash / a timeout) - NOT
   when it exits with code 2 ("not ready yet", e.g. the weekly extract
   genuinely isn't on the server yet), since retrying that immediately
   will just get the same answer. Default: 3 attempts, 30s apart. Steps
@@ -109,6 +125,7 @@ TIMEOUTS
 
 USAGE
     python run_pipeline.py                 # run the full pipeline
+    python run_pipeline.py --only 00       # refresh templates from Odoo only
     python run_pipeline.py --only 03       # run just one numbered step
     python run_pipeline.py --dry-run       # print the plan, run nothing
     python run_pipeline.py --no-lock       # skip locking (debugging only)
@@ -117,9 +134,13 @@ import argparse
 import datetime
 import logging
 import os
+import smtplib
 import subprocess
 import sys
 import time
+from email.mime.text import MIMEText
+
+from common_config import load_config
 
 try:
     import fcntl
@@ -149,6 +170,9 @@ STEP_EXIT_NOTHING_TO_IMPORT = 3  # only meaningful for 04_validate.py
 STEP_EXIT_STOP_CODES = (STEP_EXIT_NOT_READY, STEP_EXIT_NOTHING_TO_IMPORT)
 
 STEPS = [
+    # 00 refreshes templates/ from Odoo. A failure here is NON-FATAL in a
+    # full run: main() emails an alert and continues with stale templates.
+    {"id": "00", "script": "00_export_odoo.py", "max_attempts": 3, "retry_delay_s": 30},
     {"id": "01", "script": "01_download_sftp.py", "max_attempts": 3, "retry_delay_s": 30},
     {"id": "02", "script": "02_read_files.py", "max_attempts": 1, "retry_delay_s": 0},
     {"id": "03", "script": "03_clean_transform.py", "max_attempts": 1, "retry_delay_s": 0},
@@ -258,7 +282,9 @@ def _pid_is_alive(pid):
 def run_step(step):
     """
     Runs one numbered script as a subprocess, with the retry policy
-    from STEPS. Returns (returncode, duration_seconds). Always logs
+    from STEPS. Returns (returncode, duration_seconds, output) where
+    output is the combined stdout/stderr of the final attempt (used for
+    the step 00 failure email). Always logs
     full stdout/stderr - at INFO level for a clean exit, at ERROR level
     for anything else - so the log file has everything needed to debug
     a failure without re-running by hand.
@@ -293,7 +319,7 @@ def run_step(step):
             if e.stderr:
                 logger.error("--- stderr up to timeout ---\n" + e.stderr.decode(errors="replace"))
             returncode = -1  # sentinel: treated as a real failure, eligible for retry
-            stdout, stderr = "", ""
+            stdout, stderr = "", f"Step timed out after {STEP_TIMEOUT_SECONDS}s."
             duration_recorded = duration
         else:
             duration = time.monotonic() - start
@@ -303,7 +329,7 @@ def run_step(step):
             logger.info(f"Step {step['id']} ({script}) succeeded in {duration_recorded:.1f}s.")
             if stdout.strip():
                 logger.info(f"--- {script} stdout ---\n{stdout.rstrip()}")
-            return returncode, duration_recorded
+            return returncode, duration_recorded, stdout
 
         if returncode in STEP_EXIT_STOP_CODES:
             # A normal, expected "nothing to do" outcome - never
@@ -317,7 +343,7 @@ def run_step(step):
             logger.info(f"Step {step['id']} ({script}) reports {reason} - exit code {returncode}.")
             if stdout.strip():
                 logger.info(f"--- {script} stdout ---\n{stdout.rstrip()}")
-            return returncode, duration_recorded
+            return returncode, duration_recorded, stdout
 
         # Anything else is a real failure - log everything, retry if
         # attempts remain, otherwise return the failing code.
@@ -335,7 +361,127 @@ def run_step(step):
             time.sleep(retry_delay_s)
             continue
 
-        return returncode, duration_recorded
+        return returncode, duration_recorded, (stdout + "\n" + stderr).strip()
+
+
+def _templates_last_updated(cfg):
+    """
+    Returns (oldest_modified_datetime or None, any_missing) across the two
+    Odoo-generated template files, for plain-language alert emails.
+    """
+    modified_times, any_missing = [], False
+    for key, default in (
+        ("tms_article_list_path", "./templates/TMS_UniDataArticles.xlsx"),
+        ("location_list_path", "./templates/location.xlsx"),
+    ):
+        full = os.path.join(BASE_DIR, cfg.get("templates", key, fallback=default))
+        if os.path.exists(full):
+            modified_times.append(datetime.datetime.fromtimestamp(os.path.getmtime(full)))
+        else:
+            any_missing = True
+    return (min(modified_times) if modified_times else None), any_missing
+
+
+def send_alert_email(subject, body):
+    """
+    Emails the [notifications] recipients. NEVER raises: a broken alert
+    must not take the pipeline down. If SMTP isn't configured (or the
+    send fails) the would-be email is written to the log instead.
+    """
+    try:
+        cfg = load_config(os.path.join(BASE_DIR, "config.conf"))
+        smtp_host = cfg.get("notifications", "smtp_host", fallback="").strip()
+        recipients = [r.strip() for r in cfg.get("notifications", "to_addresses", fallback="").split(",") if r.strip()]
+        if not smtp_host or not recipients:
+            logger.warning(
+                "Alert email NOT sent: [notifications] smtp_host / to_addresses "
+                f"not configured. Would have sent:\nSubject: {subject}\n{body}"
+            )
+            return
+
+        smtp_port = cfg.getint("notifications", "smtp_port", fallback=587)
+        smtp_user = cfg.get("notifications", "smtp_user", fallback="")
+        smtp_password = cfg.get("notifications", "smtp_password", fallback="")
+        use_tls = cfg.getboolean("notifications", "use_tls", fallback=True)
+        sender = cfg.get("notifications", "from_address", fallback=smtp_user) or smtp_user
+
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = sender
+        msg["To"] = ", ".join(recipients)
+
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
+            if use_tls:
+                server.starttls()
+            if smtp_user:
+                server.login(smtp_user, smtp_password)
+            server.sendmail(sender, recipients, msg.as_string())
+        logger.info(f"Alert email sent to: {', '.join(recipients)} (Subject: {subject})")
+    except Exception as exc:  # noqa: BLE001 - alert must never crash the pipeline
+        logger.error(f"Could not send the alert email '{subject}' ({exc}). See the log for the original error.")
+
+
+def send_odoo_failure_email(log_path):
+    """Step 00 failed: pipeline continues with the previous lists; tell the functional team."""
+    try:
+        cfg = load_config(os.path.join(BASE_DIR, "config.conf"))
+        last_updated, any_missing = _templates_last_updated(cfg)
+    except Exception:  # noqa: BLE001
+        last_updated, any_missing = None, False
+
+    if any_missing or last_updated is None:
+        impact = ("No previous article/location lists were found, so this week's "
+                  "import will most likely fail as well.")
+    else:
+        impact = (f"The import is continuing with the previous lists (last updated "
+                  f"{last_updated:%d %b %Y}). Articles or locations added or changed in "
+                  "Odoo since then may not be recognised, so please review this "
+                  "week's results with extra care.")
+
+    body = "\n".join([
+        "Hello,",
+        "",
+        "The article and location lists could not be refreshed from Odoo.",
+        impact,
+        "",
+        "Action: please ask the technician to check the connection to Odoo.",
+        "",
+        f"(Technician: details are in the pipeline log, {log_path})",
+    ])
+    send_alert_email("Action needed: TMS article/location lists could not be updated from Odoo", body)
+
+
+def send_download_alert_email(returncode, log_path):
+    """
+    Step 01 did not produce a file this run. Exit code 2 = the weekly
+    extract isn't on the SFTP server yet; anything else = a real error.
+    In both cases the pipeline stops here (02-06 have nothing to process).
+    """
+    if returncode == STEP_EXIT_NOT_READY:
+        subject = "This week's extract has not arrived yet"
+        lines = [
+            "Hello,",
+            "",
+            "This week's extract from MSF Logistique is not available yet, so "
+            "nothing was imported.",
+            "",
+            "Action: none for now - the import will run automatically once the "
+            "file arrives. If it is still missing later in the week, please check "
+            "with MSF Logistique.",
+        ]
+    else:
+        subject = "Action needed: this week's extract could not be downloaded"
+        lines = [
+            "Hello,",
+            "",
+            "The import could not download this week's extract, so this week's "
+            "batch was NOT processed.",
+            "",
+            "Action: please ask the technician to check the connection to the "
+            "file server. The import can be re-run once it is fixed.",
+        ]
+    lines += ["", f"(Technician: details are in the pipeline log, {log_path})"]
+    send_alert_email(subject, "\n".join(lines))
 
 
 def main():
@@ -385,7 +531,29 @@ def main():
     exit_code = EXIT_OK
     try:
         for i, step in enumerate(steps_to_run):
-            returncode, _ = run_step(step)
+            returncode, _, step_output = run_step(step)
+
+            if step["id"] == "00" and returncode != STEP_EXIT_OK:
+                if args.only == "00":
+                    # Debugging 00 by hand: report the failure plainly, no email.
+                    logger.error("00_export_odoo.py failed (see output above).")
+                    exit_code = EXIT_PIPELINE_FAILED
+                    break
+                # Full run: stale templates are acceptable. Alert a human
+                # by email, then carry on with step 01 and the rest.
+                logger.warning(
+                    "00_export_odoo.py failed - templates were NOT refreshed from Odoo. "
+                    "CONTINUING the pipeline with the existing (stale) templates and "
+                    "sending an alert email."
+                )
+                send_odoo_failure_email(log_path)
+                continue
+
+            if step["id"] == "01" and returncode != STEP_EXIT_OK and args.only is None:
+                # Exit 1 (real error, after retries) or exit 2 (not ready):
+                # either way no file was downloaded, so tell a human by
+                # email. The normal stop/failure handling below still runs.
+                send_download_alert_email(returncode, log_path)
 
             if returncode == STEP_EXIT_OK:
                 continue
@@ -419,7 +587,7 @@ def main():
                         "'nothing to import' completion email still goes out."
                     )
                     notify_step = next(s for s in STEPS if s["id"] == "06")
-                    notify_returncode, _ = run_step(notify_step)
+                    notify_returncode, _, _ = run_step(notify_step)
                     if notify_returncode == STEP_EXIT_OK:
                         exit_code = EXIT_OK
                     else:

@@ -1,6 +1,15 @@
 ; SFTP connection settings for MSF Logistique extraction server
 ; Fill in real values and keep this file OUT of version control
 
+[odoo]
+; Used by 00_export_odoo.py to refresh the templates/ reference files.
+; Prefer environment variables instead of storing the password here:
+;   ODOO_URL, ODOO_USERNAME, ODOO_PASSWORD
+; (env vars win if all three are set). URL must be https.
+url =
+username =
+password =
+
 [sftp]
 #host =
 host =
@@ -69,4 +78,4 @@ use_tls = true
 from_address =
 
 ; Comma-separated list of recipients, e.g. tech1@example.org, tech2@example.org
-to_addresses = 
+to_addresses =

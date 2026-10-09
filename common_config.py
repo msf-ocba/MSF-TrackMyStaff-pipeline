@@ -22,18 +22,28 @@ def load_config(path="config.conf"):
 
 
 def get_paths(cfg):
-    """Return (and create) the local working folders defined in config.conf."""
+    """
+    Return (and create) the local working folders defined in
+    config.conf. templates_dir is included alongside download_root /
+    work_dir / output_dir so it's configured and auto-created the same
+    way as the others - individual template files (see the
+    [templates] section) default to living inside it, but can still be
+    pointed elsewhere entirely via their own explicit path in
+    config.conf if needed.
+    """
     download_root = cfg.get("local", "download_root", fallback="./downloads")
     work_dir = cfg.get("local", "work_dir", fallback="./work")
     output_dir = cfg.get("local", "output_dir", fallback="./output")
+    templates_dir = cfg.get("local", "templates_dir", fallback="./templates")
 
-    for p in (download_root, work_dir, output_dir):
+    for p in (download_root, work_dir, output_dir, templates_dir):
         os.makedirs(p, exist_ok=True)
 
     return {
         "download_root": download_root,
         "work_dir": work_dir,
         "output_dir": output_dir,
+        "templates_dir": templates_dir,
     }
 
 
