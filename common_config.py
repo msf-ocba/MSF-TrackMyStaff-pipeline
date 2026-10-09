@@ -20,6 +20,53 @@ def load_config(path="config.conf"):
     cfg.read(path)
     return cfg
 
+# Secrets: AWS Parameter Store (EC2) with local config.conf fallback (dev_local)
+DEFAULT_AWS_REGION = "us-east-1"
+
+
+def get_secret(param_name, region=None):
+    """
+    Fetch and decrypt a SecureString from AWS Systems Manager Parameter
+    Store.
+    """
+    try:
+        import boto3
+    except ImportError as exc:
+        raise RuntimeError(
+            f"A Parameter Store name ('{param_name}') is configured but boto3 "
+            f"is not installed. Run: pip install boto3"
+        ) from exc
+
+    try:
+        ssm = boto3.client("ssm", region_name=region or DEFAULT_AWS_REGION)
+        response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+        return response["Parameter"]["Value"]
+    except Exception as exc:  # botocore errors: no creds, AccessDenied, ParameterNotFound...
+        raise RuntimeError(
+            f"Could not read parameter '{param_name}' from AWS Parameter Store "
+            f"({type(exc).__name__}: {exc}). Check the parameter name, the AWS "
+            f"region, and that this machine's IAM role/credentials allow "
+            f"ssm:GetParameter (and kms:Decrypt)."
+        ) from exc
+
+
+def get_aws_region(cfg):
+    """Region from [aws] region in config.conf, default us-east-1."""
+    return cfg.get("aws", "region", fallback=DEFAULT_AWS_REGION).strip() or DEFAULT_AWS_REGION
+
+
+def resolve_secret(cfg, section, plain_key, param_key):
+    """
+    Return a secret using this precedence:
+      1. [section] <param_key>  -> read from AWS Parameter Store   (EC2)
+      2. [section] <plain_key>  -> plain value in config.conf      (laptop)
+    Returns "" if neither is set. The secret is never printed or logged.
+    """
+    param_name = cfg.get(section, param_key, fallback="").strip()
+    if param_name:
+        return get_secret(param_name, region=get_aws_region(cfg))
+    return cfg.get(section, plain_key, fallback="")
+
 
 def get_paths(cfg):
     """

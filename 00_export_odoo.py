@@ -37,6 +37,7 @@ import sys
 from pathlib import Path
 
 import requests
+from common_config import get_secret, DEFAULT_AWS_REGION
 from bs4 import BeautifulSoup
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
@@ -80,6 +81,14 @@ def load_config():
     url = os.environ.get("ODOO_URL")
     username = os.environ.get("ODOO_USERNAME")
     password = os.environ.get("ODOO_PASSWORD")
+    # Optional: name of an AWS Parameter Store SecureString holding the password
+    # (used when ODOO_PASSWORD itself is not set, e.g. on EC2).
+    password_param_env = os.environ.get("ODOO_PASSWORD_PARAM", "").strip()
+    if not password and password_param_env:
+        password = get_secret(
+            password_param_env,
+            region=os.environ.get("AWS_REGION") or DEFAULT_AWS_REGION,
+        )
     output_file = os.environ.get("TMS_ARTICLE_LIST_PATH")
     location_output_file = os.environ.get("LOCATION_LIST_PATH")
     mission_code_prefixes_path = os.environ.get("MISSION_CODE_PREFIXES_PATH")
@@ -109,19 +118,33 @@ def load_config():
         print("ERROR: [odoo] section missing from config.conf")
         sys.exit(1)
 
-    for key in ("url", "username", "password"):
+    # password may come from config.conf (dev_local) OR from AWS Parameter
+    # Store via password_param (EC2) - only one of the two is required.
+    password_param = config["odoo"].get("password_param", "").strip()
+    required_keys = ("url", "username") if password_param else ("url", "username", "password")
+    for key in required_keys:
         if key not in config["odoo"] or not config["odoo"][key]:
             print(f"ERROR: '{key}' missing from [odoo] section in config.conf")
             sys.exit(1)
 
-    print("Loaded credentials from config.conf.")
+    if password_param:
+        aws_region = config.get("aws", "region", fallback=DEFAULT_AWS_REGION).strip() or DEFAULT_AWS_REGION
+        try:
+            odoo_password = get_secret(password_param, region=aws_region)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
+        print("Loaded credentials from config.conf (password from AWS Parameter Store).")
+    else:
+        odoo_password = config["odoo"]["password"]
+        print("Loaded credentials from config.conf.")
 
     templates = config["templates"] if "templates" in config else {}
 
     return {
         "url": config["odoo"]["url"].rstrip("/"),
         "username": config["odoo"]["username"],
-        "password": config["odoo"]["password"],
+        "password": odoo_password,
         "output_file": templates.get("tms_article_list_path", DEFAULT_TMS_ARTICLE_LIST_PATH),
         "location_output_file": templates.get("location_list_path", DEFAULT_LOCATION_LIST_PATH),
         "mission_code_prefixes_path": templates.get(

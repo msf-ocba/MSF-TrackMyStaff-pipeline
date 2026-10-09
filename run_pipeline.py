@@ -140,7 +140,7 @@ import sys
 import time
 from email.mime.text import MIMEText
 
-from common_config import load_config
+from common_config import load_config, resolve_secret
 
 try:
     import fcntl
@@ -401,7 +401,8 @@ def send_alert_email(subject, body):
 
         smtp_port = cfg.getint("notifications", "smtp_port", fallback=587)
         smtp_user = cfg.get("notifications", "smtp_user", fallback="")
-        smtp_password = cfg.get("notifications", "smtp_password", fallback="")
+        # EC2: smtp_password_param (AWS Parameter Store). Dev_local: smtp_password in config.conf.
+        smtp_password = resolve_secret(cfg, "notifications", "smtp_password", "smtp_password_param")
         use_tls = cfg.getboolean("notifications", "use_tls", fallback=True)
         sender = cfg.get("notifications", "from_address", fallback=smtp_user) or smtp_user
 

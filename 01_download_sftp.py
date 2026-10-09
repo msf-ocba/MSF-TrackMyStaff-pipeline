@@ -24,7 +24,7 @@ import sys
 import datetime
 import paramiko
 
-from common_config import load_config, get_paths, get_dated_subdir, compute_week_tag
+from common_config import load_config, get_paths, get_dated_subdir, compute_week_tag, resolve_secret
 
 # Exit code contract with run_pipeline.py (the master script):
 #   0 = success, a file was downloaded, proceed with the rest of the pipeline
@@ -50,7 +50,8 @@ def connect_sftp(cfg):
     host = cfg.get("sftp", "host")
     port = cfg.getint("sftp", "port", fallback=22)
     user = cfg.get("sftp", "user")
-    password = cfg.get("sftp", "password", fallback="") or None
+    # EC2: password_param (AWS Parameter Store). Dev_local: password in config.conf.
+    password = resolve_secret(cfg, "sftp", "password", "password_param") or None
     key_path = cfg.get("sftp", "private_key_path", fallback="").strip() or None
 
     print(f"Connecting to {host}:{port} via SFTP ...")

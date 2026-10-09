@@ -1,5 +1,8 @@
-; SFTP connection settings for MSF Logistique extraction server
 ; Fill in real values and keep this file OUT of version control
+
+[aws]
+; Only used when a *_param setting below is filled in (EC2 / Parameter Store).
+region = us-east-1
 
 [odoo]
 ; Used by 00_export_odoo.py to refresh the templates/ reference files.
@@ -8,14 +11,23 @@
 ; (env vars win if all three are set). URL must be https.
 url =
 username =
+; Dev_local: put the password here.
 password =
+; EC2: leave password blank and set the Parameter Store name instead
+; (SecureString). If password_param is set it wins over password.
+password_param =
+
+; SFTP connection settings for MSF Logistique extraction server
 
 [sftp]
 #host =
 host =
 port =
 user =
+; Dev_local: put the password here.
 password =
+; EC2: leave password blank and set the Parameter Store name instead.
+password_param =
 
 ; If MSF Logistique instead gives you a private key for auth, leave
 ; password blank and set this to the key file path (password is then
@@ -68,10 +80,13 @@ mission_code_prefixes_path = ./templates/Mission_code_prefixes.txt
 ; Email settings for 05_export.py's review notification. Leave
 ; smtp_host blank to skip sending real email - the script will just
 ; print the notification content to the console instead.
-smtp_host = smtp.gmail.com
+smtp_host = smtp.office365.com
 smtp_port = 587
 smtp_user =
+; Dev_local: put the password here.
 smtp_password =
+; EC2: leave smtp_password blank and set the Parameter Store name instead.
+smtp_password_param =
 use_tls = true
 
 ; Who the notification appears to come from (defaults to smtp_user if blank)

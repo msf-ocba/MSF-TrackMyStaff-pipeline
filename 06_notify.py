@@ -94,7 +94,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 
-from common_config import load_config, get_paths
+from common_config import load_config, get_paths, resolve_secret
 
 MAX_ATTACHMENT_MB = 20  # most SMTP servers/relays reject attachments above ~20-25MB
 
@@ -615,7 +615,13 @@ def send_email(cfg, subject, body_lines, attachment_paths=None):
 
     smtp_port = cfg.getint("notifications", "smtp_port", fallback=587)
     smtp_user = cfg.get("notifications", "smtp_user", fallback="")
-    smtp_password = cfg.get("notifications", "smtp_password", fallback="")
+    # EC2: smtp_password_param (AWS Parameter Store). Dev_local: smtp_password in config.conf.
+    try:
+        smtp_password = resolve_secret(cfg, "notifications", "smtp_password", "smtp_password_param")
+    except Exception as e:
+        print(f"  WARNING: could not load the SMTP password ({e}).")
+        _print_email_fallback(subject, full_body)
+        return
     use_tls = cfg.getboolean("notifications", "use_tls", fallback=True)
     sender = cfg.get("notifications", "from_address", fallback=smtp_user)
 
@@ -659,7 +665,7 @@ def send_email(cfg, subject, body_lines, attachment_paths=None):
         _print_email_fallback(subject, full_body)
     except smtplib.SMTPAuthenticationError as e:
         print(f"  WARNING: SMTP login failed ({e}). Check [notifications] smtp_user "
-              f"and smtp_password in config.conf.")
+              f"and smtp_password (or smtp_password_param) in config.conf.")
         _print_email_fallback(subject, full_body)
     except Exception as e:
         print(f"  WARNING: failed to send notification email ({e}).")
