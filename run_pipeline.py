@@ -77,6 +77,10 @@ should check)
             completion email - see step 5/6 above. If that email
             itself fails to send, this is reported as exit code 2,
             same as any other 06_notify.py failure.
+         c2) 03_clean_transform.py found the A3 workbook has NO data
+            rows (empty extract). 04/05 are skipped, 06_notify.py is
+            run directly and sends an "empty extract" email with A3
+            attached. If that email fails, exit code 2 as above.
          d) another instance of this pipeline was already running
             (lock held) - this run exited immediately without doing
             anything, to avoid double-processing the same batch
@@ -164,10 +168,11 @@ EXIT_NOTIFY_FAILED = 2
 STEP_EXIT_OK = 0
 STEP_EXIT_NOT_READY = 2       # only meaningful for 01_download_sftp.py
 STEP_EXIT_NOTHING_TO_IMPORT = 3  # only meaningful for 04_validate.py
+STEP_EXIT_EMPTY_EXTRACT = 4      # only meaningful for 03_clean_transform.py
 
 # Step exit codes that mean "stop the pipeline here, but this is a
 # normal/expected outcome, not a failure" - see EXIT CODES above.
-STEP_EXIT_STOP_CODES = (STEP_EXIT_NOT_READY, STEP_EXIT_NOTHING_TO_IMPORT)
+STEP_EXIT_STOP_CODES = (STEP_EXIT_NOT_READY, STEP_EXIT_NOTHING_TO_IMPORT, STEP_EXIT_EMPTY_EXTRACT)
 
 STEPS = [
     # 00 refreshes templates/ from Odoo. A failure here is NON-FATAL in a
@@ -338,6 +343,8 @@ def run_step(step):
             # import this run").
             if returncode == STEP_EXIT_NOT_READY:
                 reason = "NOT READY (nothing new to process this run)"
+            elif returncode == STEP_EXIT_EMPTY_EXTRACT:
+                reason = "EMPTY EXTRACT (the A3 workbook has no data rows)"
             else:
                 reason = "NOTHING TO IMPORT (no rows required import this run)"
             logger.info(f"Step {step['id']} ({script}) reports {reason} - exit code {returncode}.")
@@ -566,6 +573,39 @@ def main():
                 # normal, silent no-op (exit code 0).
                 logger.info("Stopping pipeline: nothing new to process this run.")
                 exit_code = EXIT_OK
+                break
+
+            if returncode == STEP_EXIT_EMPTY_EXTRACT:
+                # Only 03_clean_transform.py should ever produce this: the
+                # A3 workbook has no data rows. 03 has already copied A3 to
+                # the output folder and written A3_META_....json. 04/05 have
+                # nothing to process, but a human must hear about it, so
+                # 06_notify.py is run directly (like the nothing-to-import case).
+                if any(s["id"] == "06" for s in steps_to_run):
+                    logger.warning(
+                        "03_clean_transform.py found NO data rows in the A3 workbook "
+                        "(empty extract from MSF Logistique). Skipping 04 and 05, "
+                        "running 06_notify.py now so an 'empty extract' email with "
+                        "A3 attached goes out."
+                    )
+                    notify_step = next(s for s in STEPS if s["id"] == "06")
+                    notify_returncode, _, _ = run_step(notify_step)
+                    if notify_returncode == STEP_EXIT_OK:
+                        exit_code = EXIT_OK
+                    else:
+                        logger.error(
+                            "06_notify.py failed after an EMPTY EXTRACT - the notification "
+                            "email was NOT sent. Fix [notifications] in config.conf and "
+                            "re-run 'python 06_notify.py' by hand."
+                        )
+                        exit_code = EXIT_NOTIFY_FAILED
+                else:
+                    logger.warning(
+                        "03_clean_transform.py found NO data rows in the A3 workbook. "
+                        "Stopping here since this run's plan (--only 03) doesn't "
+                        "include 06_notify.py."
+                    )
+                    exit_code = EXIT_OK
                 break
 
             if returncode == STEP_EXIT_NOTHING_TO_IMPORT:

@@ -45,6 +45,21 @@ The workbook contains all original A3 columns, together with the new
 Family and Keep? columns, and is saved to the working folder and the
 configured output folder.
 
+EMPTY A3 (NO DATA ROWS)
+
+If the A3 workbook has no data rows (headers only, or completely blank),
+there is nothing to clean. Rather than crashing - or worse, silently
+producing an empty A4 that later steps mistake for a normal batch - the
+script:
+
+  - copies the A3 workbook into the output folder (output_dir/<week_tag>/),
+  - writes A3_META_EXTRACTION_TMS_OCBA_YYMMDD.json next to it
+    (outcome "empty_extract"), which 06_notify.py reads to send a
+    dedicated "extract contains no rows" email with the A3 attached,
+  - does NOT create A4, and
+  - exits with code 4 (EXIT_EMPTY_EXTRACT). This is a handled outcome,
+    not a crash: run_pipeline.py skips 04 and 05 and runs 06_notify.py.
+
 Usage:
     python 03_clean_transform.py [path_to_A3_workbook.xlsx]
 
@@ -54,6 +69,7 @@ most recent A3 file.
 import os
 import sys
 import glob
+import json
 import shutil
 import pandas as pd
 from openpyxl import Workbook
@@ -74,6 +90,10 @@ PREFIX_ALLOWLIST_FILE = "./templates/Mission_code_prefixes.txt"  # fallback defa
 
 NOT_ASSET = "NOT ASSET"
 NOT_DEPLOYED = "NOT DEPLOYED"
+
+# Exit codes - see module docstring. Must match run_pipeline.py.
+EXIT_OK = 0
+EXIT_EMPTY_EXTRACT = 4
 
 
 def find_latest_a3(work_dir):
@@ -314,6 +334,41 @@ def save_to_output_dir(a4_path, paths):
     return dest_path
 
 
+def count_data_rows(df):
+    """Rows with at least one non-blank value (fully blank rows left behind in Excel don't count)."""
+    if df.empty:
+        return 0
+    return int(df.replace(r"^\s*$", pd.NA, regex=True).notna().any(axis=1).sum())
+
+
+def handle_empty_extract(a3_path, date_tag, paths):
+    """
+    The A3 workbook has no data rows. Copy A3 to the dated output folder
+    and write A3_META_....json so 06_notify.py can send an explanatory
+    email with A3 attached. See the module docstring (EMPTY A3).
+    Returns the meta file path.
+    """
+    week_tag = compute_week_tag()
+    output_dir = get_dated_subdir(paths["output_dir"], week_tag)
+
+    a3_out = os.path.join(output_dir, os.path.basename(a3_path))
+    if os.path.abspath(a3_out) != os.path.abspath(a3_path):
+        shutil.copy2(a3_path, a3_out)
+
+    meta = {
+        "outcome": "empty_extract",
+        "week_tag": week_tag,
+        "date_tag": date_tag,
+        "output_dir": output_dir,
+        "total_rows": 0,
+        "a3_path": a3_out,
+    }
+    meta_path = os.path.join(output_dir, f"A3_META_EXTRACTION_TMS_OCBA_{date_tag}.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    return meta_path
+
+
 def main():
     cfg = load_config()
     paths = get_paths(cfg)
@@ -338,6 +393,18 @@ def main():
             f"not open, it may also be mid-sync via OneDrive/SharePoint; wait a "
             f"moment and retry."
         )
+
+    # --- Empty extract? Handle explicitly instead of crashing / failing silently. ---
+    if count_data_rows(df) == 0:
+        print(f"\nWARNING: A3 workbook '{a3_path}' contains NO data rows "
+              f"(columns found: {len(df.columns)}). Nothing to clean or import.")
+        meta_path = handle_empty_extract(a3_path, date_tag, paths)
+        print(f"A3 copied to the output folder and meta file written: {meta_path}")
+        print("No A4 workbook was produced. 04/05 will not run, but "
+              "run_pipeline.py will still run 06_notify.py so an 'empty extract' "
+              "email (with A3 attached) goes out.")
+        sys.exit(EXIT_EMPTY_EXTRACT)
+
     check_required_columns(df)
 
     customer_code = cfg.get("extraction_rules", "customer_code", fallback="ES001MES")

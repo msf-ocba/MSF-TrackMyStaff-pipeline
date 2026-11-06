@@ -24,6 +24,13 @@ batch. Two kinds of meta file are recognised:
       getting an email either way, not on checking server logs to see
       whether the pipeline ran.
 
+  - A3_META_EXTRACTION_TMS_OCBA_YYMMDD.json
+      Written by 03_clean_transform.py when the A3 workbook has NO data
+      rows (the MSF Logistique extract came through empty). There is no
+      A4/A5/A6 for this batch. Triggers a distinct "extract is empty"
+      email, with the A3 workbook attached, so the batch doesn't fail
+      silently - see build_empty_extract_email().
+
 Whichever meta file is most recently modified is used automatically;
 see find_latest_meta().
 
@@ -110,6 +117,7 @@ NOT_DEPLOYED = "NOT DEPLOYED"
 META_PATTERNS = (
     "A6_META_EXTRACTION_TMS_OCBA_*.json",
     "A5_META_EXTRACTION_TMS_OCBA_*.json",
+    "A3_META_EXTRACTION_TMS_OCBA_*.json",
 )
 
 
@@ -142,7 +150,7 @@ def find_latest_meta(output_dir):
         return chosen
 
     raise FileNotFoundError(
-        f"No A6_META_EXTRACTION_TMS_OCBA_*.json or A5_META_EXTRACTION_TMS_OCBA_*.json "
+        f"No A6_META_EXTRACTION_TMS_OCBA_*.json, A5_META_... or A3_META_... json "
         f"file found under '{output_dir}' (checked dated subfolders and the flat "
         f"folder). Run 05_export.py (or, for a batch with nothing to import, "
         f"04_validate.py) first."
@@ -680,6 +688,51 @@ def _print_email_fallback(subject, body_lines):
     print("  --- end email content ---\n")
 
 
+def build_empty_extract_email(week_tag, date_tag, a3_path):
+    """
+    Email for a batch whose A3 workbook has no data rows (written by
+    03_clean_transform.py). Always "action needed": an empty weekly
+    extract is unexpected and someone should confirm with MSF
+    Logistique whether it is genuine or a faulty export.
+    """
+    subject = f"[MSF TMS Import] {week_tag} - Batch {date_tag} - EMPTY EXTRACT - action needed"
+    body_lines = [
+        f"Batch {date_tag} (folder {week_tag}): the extract received from MSF Logistique "
+        f"contains NO rows.",
+        "REVIEW REQUIRED: nothing was cleaned, validated or imported into TMS for this batch.",
+        "",
+        "WHAT HAPPENED",
+        "   The A3 workbook (the extract converted to Excel) has a header row but no data rows,",
+        "   so the pipeline stopped after step 03. No A4, A5, A5B or A6 file was produced.",
+        "",
+        "WHAT TO DO",
+        "   1. Check the attached A3 file to confirm it is really empty.",
+        "   2. Ask MSF Logistique whether there were genuinely no new assets this week, or whether",
+        "      the export failed or was filtered incorrectly.",
+        "   3. If a corrected extract is provided, re-run the pipeline for this batch.",
+        "",
+    ]
+    body_lines.append("FILES")
+    if a3_path:
+        body_lines.append(f"Output folder: {os.path.dirname(a3_path)}")
+    return subject, body_lines
+
+
+def _handle_empty_extract(cfg, meta, meta_path):
+    """Handles the A3_META_....json case (empty A3 - see module docstring)."""
+    required = ["week_tag", "date_tag", "a3_path"]
+    missing = [k for k in required if k not in meta]
+    if missing:
+        raise KeyError(f"Meta file '{meta_path}' is missing expected field(s): {missing}.")
+
+    a3_path = meta["a3_path"]
+    if a3_path and not os.path.exists(a3_path):
+        print(f"  WARNING: A3 file recorded in meta ('{a3_path}') no longer exists. "
+              f"Sending the email without it.")
+    subject, body_lines = build_empty_extract_email(meta["week_tag"], meta["date_tag"], a3_path)
+    send_email(cfg, subject, body_lines, attachment_paths=[a3_path] if a3_path else [])
+
+
 def _handle_nothing_to_import(cfg, meta, meta_path):
     """
     Handles the A5_META_....json case (see module docstring): a batch
@@ -722,6 +775,13 @@ def main():
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
+
+    if meta.get("outcome") == "empty_extract":
+        _handle_empty_extract(cfg, meta, meta_path)
+        print("\nDone. If SMTP wasn't configured yet, the notification content was "
+              "printed above instead of sent - fill in [notifications] in config.conf "
+              "to enable real emails.")
+        return
 
     if meta.get("outcome") == "nothing_to_import":
         _handle_nothing_to_import(cfg, meta, meta_path)
